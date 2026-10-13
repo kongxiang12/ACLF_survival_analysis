@@ -1,0 +1,4357 @@
+# ============================================================
+# ACLF Early Baseline Survival Prediction - V4 MICE 28/90
+# ============================================================
+# Study design
+#
+# Development cohort
+#   ├── DEVELOPMENT-only hyperparameter tuning (single 10-fold CV;
+#   │      a tuning tool only)
+#   ├── fit 4 final base models on FULL development
+#   └── External validation cohort (n = 317)
+#          └── independent final evaluation (locked pipeline)
+#
+# Main endpoint:
+#   OS     = survival/follow-up time
+#   Death  = 1 death, 0 censored
+#
+# Prediction horizons:
+#   28 days / 90 days only
+#
+# Core models:
+#   1. Cox PH
+#   2. Elastic Net Cox
+#   3. Random Survival Forest
+#   4. XGBoost survival
+#
+# IMPORTANT
+# ------------------------------------------------------------
+# 1. TEST is locked after the initial split.
+# 2. All preprocessing, tuning, model selection, and calibration
+#    parameters are learned from DEVELOPMENT only.
+# 3. 28/90-day mortality are extracted from survival models;
+#    they are not three independent binary models.
+# 4. This FIX7 FINAL deliberately avoids ranger formula interface.
+# 5. XGBoost survival API varies by package version.
+#    This script uses the installed versions shown in your log:
+#       R 4.6.1
+#       survival 3.8.11
+#       glmnet 5.0
+#       ranger 0.18.0
+#       xgboost 3.2.1.1
+# 6. The script stops rather than silently producing invalid metrics
+#    when an essential model/API fails.
+# ============================================================
+
+options(stringsAsFactors = FALSE)
+options(timeout = 1200)
+set.seed(20260831)
+
+# ============================================================
+# 0. USER SETTINGS
+# ============================================================
+
+# !!! Set this to your actual data file
+# Development (training) cohort (n = 480)
+DEV_FILE  <- "./data/development_cohort.xlsx"
+DEV_SHEET <- "Sheet1"
+
+# External validation cohort (n = 317)
+TEST_FILE <- "./data/external_validation_cohort.xlsx"
+
+# !!! Set this to where results should be saved
+OUT_DIR <- "./results"
+
+# Outcome variable names in your Excel file
+TIME_VAR  <- "os_days"
+EVENT_VAR <- "event"
+
+# OS unit in the source data
+# "days" = already days
+# "hours" = convert hours -> days
+OS_UNIT <- "days"
+
+# CV
+N_FOLDS <- 10
+
+# Reproducible seeds
+SEED_SPLIT <- 20260831
+SEED_CV    <- 20260901
+SEED_MODEL <- 20260902
+
+# MICE multiple imputation
+MICE_M     <- 5     # number of imputed datasets
+MICE_MAXIT <- 5     # iterations per chain
+
+# Clinical prediction horizons
+PRED_TIMES <- c(28, 90)
+
+# Predictor missingness filter: a predictor must be present in BOTH cohorts
+# and have <= this fraction missing in EACH of DEV and TEST; otherwise dropped.
+# (DEV-sparse like CRP ~87%, or TEST-sparse like
+#  cohort-specific labs ~60%+, are noise, not signal to be MICE-imputed.)
+MISSING_THRESHOLD <- 0.5   # 50%
+
+# Variables that must NOT be predictors
+ID_VARS <- c(
+  "ID", "Patient_ID", "patient_id", "Record_ID", "record_id",
+  "MRN", "Hospital_ID",
+  "Admission_Date", "Discharge_Date",
+  "Death_Date", "Followup_Date"
+)
+
+# Variables intended to be categorical.
+# Categorical variables in the source data: sex_name (M/F), cirrhosis_etiology (etiology).
+# All remaining 0/1 flag variables (AD_evidence_*, hepatorenal_syndrome) are treated as continuous binary variables.
+CATEGORICAL_VARS <- c(
+  "sex_name",
+  "cirrhosis_etiology"
+)
+
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# Output sub-folders: figures, tables, RDS
+OUT_DIR_FIG <- file.path(OUT_DIR, "figures")
+OUT_DIR_TXT <- file.path(OUT_DIR, "tables")
+OUT_DIR_RDS <- file.path(OUT_DIR, "RDS")
+
+dir.create(OUT_DIR_FIG, recursive = TRUE, showWarnings = FALSE)
+dir.create(OUT_DIR_TXT, recursive = TRUE, showWarnings = FALSE)
+dir.create(OUT_DIR_RDS, recursive = TRUE, showWarnings = FALSE)
+
+# ============================================================
+# 1. PACKAGES
+# ============================================================
+
+required_pkgs <- c(
+  "readxl",
+  "openxlsx",
+  "dplyr",
+  "tidyr",
+  "purrr",
+  "tibble",
+  "ggplot2",
+  "survival",
+  "glmnet",
+  "ranger",
+  "xgboost",
+  "survminer",
+  "mice",
+  "kernelshap",
+  "shapviz",
+  "pROC",
+  "patchwork"
+)
+
+missing_pkgs <- required_pkgs[
+  !vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_pkgs) > 0) {
+  message("The following R packages will be installed:")
+  message(paste(missing_pkgs, collapse = ", "))
+  install.packages(
+    missing_pkgs,
+    repos = "https://cloud.r-project.org",
+    dependencies = c("Depends", "Imports", "LinkingTo"),
+    type = "binary"
+  )
+}
+
+still_missing <- required_pkgs[
+  !vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(still_missing) > 0) {
+  stop(
+    "The following packages still failed to install:",
+    paste(still_missing, collapse = ", ")
+  )
+}
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(openxlsx)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(ggplot2)
+  library(survival)
+  library(glmnet)
+  library(ranger)
+  library(xgboost)
+  library(survminer)
+  library(mice)
+  library(kernelshap)
+  library(shapviz)
+  library(pROC)
+  library(patchwork)
+})
+
+message("====================================================")
+message("Package versions")
+message("R          : ", getRversion())
+message("survival   : ", packageVersion("survival"))
+message("glmnet     : ", packageVersion("glmnet"))
+message("ranger     : ", packageVersion("ranger"))
+message("xgboost    : ", packageVersion("xgboost"))
+message("survminer   : ", packageVersion("survminer"))
+message("mice        : ", packageVersion("mice"))
+message("====================================================")
+
+# ============================================================
+# 2. READ DATA
+# ============================================================
+
+if (!file.exists(DEV_FILE)) {
+  stop("DEV_FILE not found: ", DEV_FILE)
+}
+if (!file.exists(TEST_FILE)) {
+  stop("TEST_FILE not found: ", TEST_FILE)
+}
+
+dev_raw  <- openxlsx::read.xlsx(DEV_FILE, sheet = DEV_SHEET) |> as.data.frame()
+test_raw <- openxlsx::read.xlsx(TEST_FILE) |> as.data.frame()
+
+# Record the source so that §4 can split by cohort (__cohort__ is not used as a predictor)
+dev_raw[["__cohort__"]]  <- "Development"
+test_raw[["__cohort__"]] <- "External_validation"
+
+# patient_id may have different types in the two files; coerce to character before merging.
+# The remaining shared columns (33 predictors + os_days/event) are already unit-aligned with consistent types.
+dev_raw[["patient_id"]]  <- as.character(dev_raw[["patient_id"]])
+test_raw[["patient_id"]] <- as.character(test_raw[["patient_id"]])
+
+# The two files have identical column names (36 columns each: patient_id + os_days/event + 33 predictors),
+# and are combined with dplyr::bind_rows by column name, filling missing columns with NA (§5 later keeps only the 33 predictors shared by both cohorts).
+dat <- dplyr::bind_rows(dev_raw, test_raw)
+
+message("Development cohort raw sample size: ", nrow(dev_raw))
+message("External validation cohort raw sample size: ", nrow(test_raw))
+message("Combined sample size: ", nrow(dat))
+
+for (nm in c(TIME_VAR, EVENT_VAR)) {
+  if (!(nm %in% names(dev_raw)) || !(nm %in% names(test_raw))) {
+    stop(
+      "\nOutcome variable not found: ", nm, "\n",
+      "DEV columns:\n", paste(names(dev_raw), collapse = ", "), "\n",
+      "TEST columns:\n", paste(names(test_raw), collapse = ", ")
+    )
+  }
+}
+
+# ============================================================
+# 3. OUTCOME CLEANING
+# ============================================================
+
+clean_event <- function(x) {
+
+  if (is.factor(x)) {
+    x <- as.character(x)
+  }
+
+  if (is.character(x)) {
+
+    x <- trimws(x)
+
+    x[x %in% c(
+      "0", "Alive", "alive",
+      "Survive", "survive",
+      "Censored", "censored"
+    )] <- "0"
+
+    x[x %in% c(
+      "1", "Death", "death",
+      "Dead", "dead",
+      "Event", "event"
+    )] <- "1"
+  }
+
+  z <- suppressWarnings(as.numeric(x))
+
+  bad <- !is.na(z) & !z %in% c(0, 1)
+
+  if (any(bad)) {
+    stop(
+      EVENT_VAR,
+      " must be coded 0/1; 0 = censored/alive, 1 = death/event.\n",
+      "Invalid values found: ",
+      paste(unique(x[bad]), collapse = ", ")
+    )
+  }
+
+  z
+}
+
+dat[[EVENT_VAR]] <- clean_event(dat[[EVENT_VAR]])
+dat[[TIME_VAR]] <- suppressWarnings(as.numeric(dat[[TIME_VAR]]))
+
+if (OS_UNIT == "hours") {
+  dat[[TIME_VAR]] <- dat[[TIME_VAR]] / 24
+} else if (OS_UNIT != "days") {
+  stop("OS_UNIT must be 'days' or 'hours'.")
+}
+
+dat <- dat[
+  is.finite(dat[[TIME_VAR]]) &
+    dat[[TIME_VAR]] > 0 &
+    !is.na(dat[[EVENT_VAR]]),
+  ,
+  drop = FALSE
+]
+
+message("====================================================")
+message("Endpoint coding check (by cohort)")
+message("Development cohort: 90-day follow-up; event=0 with os_days=91 denotes survival past day 90")
+message("External validation cohort: os_days is the actual follow-up in days")
+message("For 90-day analysis, event=0 & os_days=91 is a valid 90-day survivor.")
+message("====================================================")
+message("Valid patients: ", nrow(dat))
+message("Events: ", sum(dat[[EVENT_VAR]] == 1))
+message("Censored: ", sum(dat[[EVENT_VAR]] == 0))
+message("Overall mortality: ", round(mean(dat[[EVENT_VAR]] == 1) * 100, 2), "%")
+message("====================================================")
+
+# ============================================================
+# 4. COHORT-BASED SPLIT (EXTERNAL VALIDATION, NO INTERNAL TEST)
+# ============================================================
+# TRIPOD Type 3 (external validation) design:
+#   DEVELOPMENT = development cohort (n = 480; training + tuning + model selection)
+#   TEST        = external validation cohort (n = 317; held-out external validation)
+# There is no random 80/20 internal test split: TEST comes entirely from a separate population, independent of DEVELOPMENT.
+# ============================================================
+
+N_ALL   <- nrow(dat)
+dev_idx <- which(dat[["__cohort__"]] == "Development")
+test_idx <- which(dat[["__cohort__"]] == "External_validation")
+
+if (length(dev_idx) == 0L || length(test_idx) == 0L) {
+  stop("Development or Test is empty: check that __cohort__ is labelled correctly.")
+}
+
+if (length(intersect(dev_idx, test_idx)) != 0L ||
+    length(union(dev_idx, test_idx)) != N_ALL) {
+  stop("Development/Test is not a mutually exclusive and exhaustive split.")
+}
+
+development <- dat[dev_idx, , drop = FALSE]
+test_set    <- dat[test_idx, , drop = FALSE]
+
+message("====================================================")
+message("LOCKED COHORT SPLIT")
+message("ALL         = ", N_ALL)
+message("DEVELOPMENT = ", nrow(development), " (development cohort)")
+message("TEST        = ", nrow(test_set), " (external validation)")
+message("====================================================")
+
+split_summary <- tibble(
+  Dataset = c("ALL", "DEVELOPMENT", "TEST"),
+  N = c(
+    nrow(dat),
+    nrow(development),
+    nrow(test_set)
+  ),
+  Death = c(
+    sum(dat[[EVENT_VAR]] == 1),
+    sum(development[[EVENT_VAR]] == 1),
+    sum(test_set[[EVENT_VAR]] == 1)
+  ),
+  Censored = c(
+    sum(dat[[EVENT_VAR]] == 0),
+    sum(development[[EVENT_VAR]] == 0),
+    sum(test_set[[EVENT_VAR]] == 0)
+  )
+) |>
+  mutate(
+    Event_Rate = Death / N
+  )
+
+print(split_summary)
+
+write.csv(
+  split_summary,
+  file.path(OUT_DIR_TXT, "00_split_summary.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+# Store row-level allocation (permanent record of the cohort split).
+allocation <- tibble(
+  Original_Row = seq_len(N_ALL),
+  Cohort = dat[["__cohort__"]],
+  Dataset = ifelse(
+    dat[["__cohort__"]] == "Development",
+    "DEVELOPMENT",
+    "TEST"
+  )
+)
+
+write.csv(
+  allocation,
+  file.path(OUT_DIR_TXT, "00_LOCKED_cohort_allocation.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+# ============================================================
+# 5. PRE-SPECIFIED PREDICTOR SET (25 shared variables)
+# ============================================================
+# The 33 baseline predictors shared by both cohorts (outcome/time/ID columns removed)
+# (both cohorts have <50% missingness, per the cohort-alignment step). Listed explicitly here so the
+# feature set is fixed and reproducible, rather than auto-trimmed with intersect(names(...)).
+# ============================================================
+
+predictor_vars <- c(
+  "age_at_admission",
+  "sex_name",
+  "cirrhosis_etiology",
+  "AD_evidence_ascites",
+  "AD_evidence_HE_ICD",
+  "AD_evidence_infection",
+  "AD_evidence_GI_bleed",
+  "hepatorenal_syndrome",
+  "alt",
+  "ast",
+  "bilirubin_total",
+  "albumin",
+  "alkaline_phosphatase",
+  "pt",
+  "inr",
+  "wbc",
+  "neutrophils_absolute",
+  "lymphocytes_absolute",
+  "monocytes_absolute",
+  "hemoglobin",
+  "platelet_count",
+  "bun",
+  "creatinine",
+  "sodium",
+  "crp",
+  "ggt",
+  "cholinesterase",
+  "prealbumin",
+  "fibrinogen",
+  "pct",
+  "systolic_bp",
+  "diastolic_bp",
+  "d_dimer"
+)
+
+# Safety check: these 33 variables must be present in both Development and Test.
+missing_in_dev  <- setdiff(predictor_vars, names(development))
+missing_in_test <- setdiff(predictor_vars, names(test_set))
+if (length(missing_in_dev) > 0L || length(missing_in_test) > 0L) {
+  stop(
+    "Pre-specified predictor variables are missing.\n",
+    "Missing in Development: ", paste(missing_in_dev, collapse = ", "), "\n",
+    "Missing in Test: ", paste(missing_in_test, collapse = ", ")
+  )
+}
+
+# Remove variables with <=1 observed unique value in DEVELOPMENT.
+predictor_vars <- predictor_vars[
+  vapply(
+    development[predictor_vars],
+    function(x) {
+      length(unique(x[!is.na(x)])) > 1
+    },
+    logical(1)
+  )
+]
+
+# Remove predictors with > MISSING_THRESHOLD missingness in EITHER cohort.
+# Deployability constraint (a pre-defined rule that only uses X missingness, not the outcome, so it does not leak data):
+# a variable must be sufficiently collected in BOTH Development and Test (missingness <= 50% in each).
+# In cross-cohort external validation, TEST represents the real deployment population, so the model may only use variables that are actually collectable there;
+# screening on DEV alone would keep variables that are present in the development set but largely missing in the external validation cohort,
+# which could only be filled with MICE-imputed noise at TEST time.
+dev_miss  <- vapply(development[predictor_vars], function(x) mean(is.na(x)), numeric(1))
+test_miss <- vapply(test_set[predictor_vars],     function(x) mean(is.na(x)), numeric(1))
+drop_missing <- names(dev_miss)[
+  dev_miss > MISSING_THRESHOLD | test_miss > MISSING_THRESHOLD
+]
+
+if (length(drop_missing) > 0L) {
+  message("Dropping predictors with > ", MISSING_THRESHOLD * 100, "% missingness in either DEV or TEST:")
+  drop_df <- data.frame(
+    Variable = drop_missing,
+    Dev_Missing_pct  = round(dev_miss[drop_missing] * 100, 1),
+    Test_Missing_pct = round(test_miss[drop_missing] * 100, 1),
+    stringsAsFactors = FALSE
+  )
+  print(drop_df, row.names = FALSE)
+  write.csv(
+    drop_df,
+    file.path(OUT_DIR_TXT, "01b_dropped_missing_variables.csv"),
+    row.names = FALSE,
+    fileEncoding = "UTF-8"
+  )
+  predictor_vars <- predictor_vars[!predictor_vars %in% drop_missing]
+} else {
+  message("No predictor exceeds ", MISSING_THRESHOLD * 100, "% missingness in Development or Test; no variables dropped.")
+}
+
+if (length(predictor_vars) < 2) {
+  stop("Fewer than 2 valid baseline predictors remain in Development.")
+}
+
+# Character + user-defined categorical variables.
+char_vars <- predictor_vars[
+  vapply(
+    development[predictor_vars],
+    is.character,
+    logical(1)
+  )
+]
+
+factor_vars <- unique(
+  c(
+    intersect(CATEGORICAL_VARS, predictor_vars),
+    char_vars
+  )
+)
+
+# Save predictor dictionary.
+predictor_dictionary <- tibble(
+  Variable = predictor_vars,
+  Is_Categorical = predictor_vars %in% factor_vars
+)
+
+write.csv(
+  predictor_dictionary,
+  file.path(OUT_DIR_TXT, "01_predictor_dictionary.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+# ============================================================
+# 6. PREPROCESSOR
+# ============================================================
+# IMPORTANT:
+# This preprocessor is fitted using DEVELOPMENT only.
+# For final model fitting this is appropriate.
+#
+# For CV, a separate preprocessor is fitted inside every fold.
+# This avoids leakage from validation fold into preprocessing.
+# ============================================================
+
+fit_preprocessor <- function(train_df, predictors, factor_vars) {
+
+  work <- train_df[, predictors, drop = FALSE]
+
+  medians <- list()
+  modes <- list()
+  factor_levels <- list()
+
+  for (v in predictors) {
+
+    x <- work[[v]]
+
+    if (v %in% factor_vars) {
+
+      x <- as.character(x)
+
+      observed <- x[!is.na(x)]
+
+      if (length(observed) == 0) {
+        stop("Categorical variable ", v, " is entirely missing in the training set.")
+      }
+
+      tab <- table(observed)
+
+      mode_value <- names(tab)[which.max(tab)]
+
+      lev <- sort(unique(observed))
+
+      modes[[v]] <- mode_value
+      factor_levels[[v]] <- lev
+
+      x[is.na(x)] <- mode_value
+
+      # Novel values will be handled in apply_preprocessor.
+      work[[v]] <- factor(
+        x,
+        levels = lev
+      )
+
+    } else {
+
+      x <- suppressWarnings(as.numeric(x))
+
+      med <- stats::median(
+        x,
+        na.rm = TRUE
+      )
+
+      if (!is.finite(med)) {
+        med <- 0
+      }
+
+      medians[[v]] <- med
+
+      x[is.na(x)] <- med
+
+      work[[v]] <- x
+    }
+  }
+
+  mm <- stats::model.matrix(
+    ~ . - 1,
+    data = work,
+    na.action = stats::na.pass
+  )
+
+  # Remove zero-variance columns.
+  keep <- apply(
+    mm,
+    2,
+    function(z) {
+      length(unique(z[is.finite(z)])) > 1
+    }
+  )
+
+  mm <- mm[, keep, drop = FALSE]
+
+  if (ncol(mm) == 0) {
+    stop("No features remain after preprocessing.")
+  }
+
+  means <- colMeans(mm)
+
+  sds <- apply(
+    mm,
+    2,
+    stats::sd
+  )
+
+  sds[!is.finite(sds) | sds == 0] <- 1
+
+  list(
+    predictors = predictors,
+    factor_vars = factor_vars,
+    medians = medians,
+    modes = modes,
+    factor_levels = factor_levels,
+    columns = colnames(mm),
+    means = means,
+    sds = sds
+  )
+}
+
+apply_preprocessor <- function(prep, df, scale = TRUE) {
+
+  work <- df[, prep$predictors, drop = FALSE]
+
+  for (v in prep$predictors) {
+
+    x <- work[[v]]
+
+    if (v %in% prep$factor_vars) {
+
+      x <- as.character(x)
+
+      x[is.na(x)] <- prep$modes[[v]]
+
+      # Novel factor levels are treated as the mode.
+      known <- prep$factor_levels[[v]]
+
+      x[!x %in% known] <- prep$modes[[v]]
+
+      work[[v]] <- factor(
+        x,
+        levels = known
+      )
+
+    } else {
+
+      x <- suppressWarnings(as.numeric(x))
+
+      x[is.na(x)] <- prep$medians[[v]]
+
+      work[[v]] <- x
+    }
+  }
+
+  mm <- stats::model.matrix(
+    ~ . - 1,
+    data = work,
+    na.action = stats::na.pass
+  )
+
+  missing_cols <- setdiff(
+    prep$columns,
+    colnames(mm)
+  )
+
+  if (length(missing_cols) > 0) {
+
+    add <- matrix(
+      0,
+      nrow = nrow(mm),
+      ncol = length(missing_cols),
+      dimnames = list(
+        NULL,
+        missing_cols
+      )
+    )
+
+    mm <- cbind(
+      mm,
+      add
+    )
+  }
+
+  extra_cols <- setdiff(
+    colnames(mm),
+    prep$columns
+  )
+
+  if (length(extra_cols) > 0) {
+
+    mm <- mm[
+      ,
+      setdiff(
+        colnames(mm),
+        extra_cols
+      ),
+      drop = FALSE
+    ]
+  }
+
+  mm <- mm[
+    ,
+    prep$columns,
+    drop = FALSE
+  ]
+
+  if (scale) {
+
+    mm <- sweep(
+      mm,
+      2,
+      prep$means,
+      "-"
+    )
+
+    mm <- sweep(
+      mm,
+      2,
+      prep$sds,
+      "/"
+    )
+  }
+
+  mm
+}
+
+# ============================================================
+# 6b. MICE MULTIPLE IMPUTATION PREPROCESSOR
+# ============================================================
+# Used for the OUTER-CV evaluation, the final models and the
+# independent TEST. Inner hyperparameter tuning keeps the fast
+# median/mode preprocessor above (tuning is insensitive to the
+# imputation method).
+#
+# fit_mice()            -> fit MICE on a TRAINING set only.
+# mice_complete_matrices() -> convert completed data to standardised
+#                             model matrices (list of M).
+# predict_mice()        -> impute a NEW set with the fitted model via
+#                          mice.mids(newdata=...) and return M matrices.
+#
+# Leakage safeguard (P0): imputation uses ONLY baseline predictors.
+# The outcome (OS / event indicator) and anything derived from it
+# (e.g. Nelson-Aalen cumulative hazard) are deliberately NOT used as
+# imputation predictors, so validation/test rows can be imputed before
+# their outcome is ever observed.
+# ============================================================
+
+fit_mice <- function(train_df, predictors, factor_vars,
+                     m = MICE_M, maxit = MICE_MAXIT, seed = SEED_MODEL) {
+
+  # Leakage safeguard: imputation uses ONLY baseline predictors. No
+  # outcome-derived information (OS, event indicator, Nelson-Aalen
+  # cumulative hazard) enters the imputation model, so validation/test
+  # rows can later be imputed without observing their outcome.
+  imp <- train_df[, predictors, drop = FALSE]
+
+  factor_levels <- list()
+  for (v in factor_vars) {
+    imp[[v]] <- as.factor(as.character(imp[[v]]))
+    factor_levels[[v]] <- levels(imp[[v]])
+  }
+
+  meth <- rep("pmm", ncol(imp))
+  names(meth) <- colnames(imp)
+  for (v in factor_vars) {
+    nlev <- length(unique(imp[[v]][!is.na(imp[[v]])]))
+    meth[v] <- if (nlev <= 2) "logreg" else "polyreg"
+  }
+
+  mids <- mice::mice(
+    imp,
+    m = m,
+    maxit = maxit,
+    method = meth,
+    printFlag = FALSE,
+    seed = seed
+  )
+
+  list(
+    mids = mids,
+    predictors = predictors,
+    factor_vars = factor_vars,
+    factor_levels = factor_levels,
+    m = m,
+    maxit = maxit
+  )
+}
+
+mice_complete_matrices <- function(mids, prep_struct, keep_rows = NULL) {
+  comp <- mice::complete(mids, "all")
+  lapply(comp, function(df) {
+    if (!is.null(keep_rows)) {
+      df <- df[keep_rows, , drop = FALSE]
+    }
+    apply_preprocessor(prep_struct, df)
+  })
+}
+
+predict_mice <- function(mice_obj, new_df, prep_struct) {
+  predictors <- mice_obj$predictors
+  factor_vars <- mice_obj$factor_vars
+
+  # Leakage safeguard: new_df's outcome (OS / event / any derived
+  # hazard) is NOT touched here. A new row is imputed from its baseline
+  # predictors only, mirroring fit_mice().
+
+  newimp <- new_df[, predictors, drop = FALSE]
+
+  for (v in factor_vars) {
+    newimp[[v]] <- factor(
+      as.character(newimp[[v]]),
+      levels = mice_obj$factor_levels[[v]]
+    )
+  }
+
+  mids_new <- mice::mice.mids(
+    mice_obj$mids,
+    newdata = newimp,
+    maxit = mice_obj$maxit,
+    printFlag = FALSE
+  )
+
+  # mice.mids(newdata = ...) returns a mids object already filtered to
+  # ONLY the new rows, so no keep_rows subsetting is needed (and any
+  # offset indexing would be out of bounds).
+  mice_complete_matrices(
+    mids_new,
+    prep_struct
+  )
+}
+
+# Full-development preprocessor.
+prep_full <- fit_preprocessor(
+  development,
+  predictor_vars,
+  factor_vars
+)
+
+X_dev <- apply_preprocessor(
+  prep_full,
+  development,
+  scale = TRUE
+)
+
+X_test <- apply_preprocessor(
+  prep_full,
+  test_set,
+  scale = TRUE
+)
+
+y_dev <- survival::Surv(
+  development[[TIME_VAR]],
+  development[[EVENT_VAR]]
+)
+
+y_test <- survival::Surv(
+  test_set[[TIME_VAR]],
+  test_set[[EVENT_VAR]]
+)
+
+message("Raw predictors: ", length(predictor_vars))
+message("Processed predictors: ", ncol(X_dev))
+
+saveRDS(
+  prep_full,
+  file.path(OUT_DIR_RDS, "01_final_development_preprocessor.rds")
+)
+
+# ============================================================
+# 6c. LASSO VARIABLE SELECTION (Cox / Elastic Net ONLY)
+# ============================================================
+# LASSO (L1-penalized Cox, glmnet) selects a REDUCED predictor set used
+# ONLY by the conventional Cox and Elastic Net–Cox models. This lowers the
+# Cox model's effective degrees of freedom (the events-per-variable ratio
+# is otherwise low) while the tree-based models (RSF, XGBoost), which
+# regularize internally, stay on the full predictor set.
+#
+# Selection is performed on the DEVELOPMENT cohort only, on the median/mode-
+# imputed standardized matrix (X_dev), using the CV-minimum lambda
+# (lambda.min). The TEST set is NOT involved in variable selection (no
+# leakage).
+# ============================================================
+
+set.seed(SEED_MODEL)
+
+lasso_cv <- glmnet::cv.glmnet(
+  x = X_dev,
+  y = y_dev,
+  family = "cox",
+  alpha = 1,
+  nfolds = N_FOLDS,
+  standardize = FALSE
+)
+
+lasso_lambda_min <- lasso_cv$lambda.min
+
+lasso_coef_min <- as.matrix(
+  stats::coef(lasso_cv, s = "lambda.min")
+)
+
+lasso_sel_cols <- rownames(lasso_coef_min)[
+  abs(lasso_coef_min[, 1]) > 1e-8
+]
+
+# Map the selected one-hot columns back to the ORIGINAL predictor level.
+# A categorical predictor (sex_name, cirrhosis_etiology) is selected when
+# ANY of its dummy columns has a non-zero LASSO coefficient.
+cox_enet_vars <- predictor_vars[
+  vapply(predictor_vars, function(v) {
+    v_cols <- if (v %in% factor_vars) {
+      grep(paste0("^", v), lasso_sel_cols, value = TRUE)
+    } else {
+      intersect(v, lasso_sel_cols)
+    }
+    length(v_cols) > 0L
+  }, logical(1))
+]
+
+if (length(cox_enet_vars) == 0L) {
+  message("LASSO (lambda.min) selected no variables; Cox / ElasticNet fall back to the full predictor set.")
+  cox_enet_vars <- predictor_vars
+}
+
+message(
+  "LASSO (lambda.min, lambda = ", signif(lasso_lambda_min, 4),
+  ") selected for Cox / ElasticNet ", length(cox_enet_vars),
+  " / ", length(predictor_vars), " variables:"
+)
+print(cox_enet_vars)
+
+# Persist the LASSO selection for reproducibility.
+write.csv(
+  data.frame(
+    Variable = predictor_vars,
+    Selected_For_Cox_ENet = predictor_vars %in% cox_enet_vars,
+    stringsAsFactors = FALSE
+  ),
+  file.path(OUT_DIR_TXT, "01c_LASSO_variable_selection.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+# ---- LASSO coefficient path plot (coefficients vs log lambda) ----
+# The full glmnet path lives inside the cv.glmnet object (glmnet.fit), so
+# plotting it directly guarantees the exact lambda grid used by CV. In
+# plot.glmnet(xvar = "lambda") the x-axis is log(lambda); lambda.min and
+# lambda.1se are marked with vertical reference lines.
+lasso_path_fit <- lasso_cv$glmnet.fit
+
+plot_lasso_path <- function() {
+  plot(
+    lasso_path_fit,
+    xvar = "lambda",
+    label = TRUE,
+    main = "LASSO coefficient path (Cox, L1 penalty)"
+  )
+  abline(v = log(lasso_cv$lambda.min), col = "firebrick", lty = 2, lwd = 2)
+  abline(v = log(lasso_cv$lambda.1se), col = "steelblue", lty = 2, lwd = 2)
+  legend(
+    "topright",
+    legend = c(
+      paste0("lambda.min = ", signif(lasso_cv$lambda.min, 3)),
+      paste0("lambda.1se = ", signif(lasso_cv$lambda.1se, 3))
+    ),
+    col = c("firebrick", "steelblue"),
+    lty = 2, lwd = 2, cex = 0.85, bty = "o", bg = "white"
+  )
+}
+
+png(
+  file.path(OUT_DIR_FIG, "01c_LASSO_coefficient_path.png"),
+  width = 2400, height = 1500, res = 300
+)
+plot_lasso_path()
+dev.off()
+
+pdf(
+  file.path(OUT_DIR_FIG, "01c_LASSO_coefficient_path.pdf"),
+  width = 10, height = 6
+)
+plot_lasso_path()
+dev.off()
+
+# ---- LASSO number of selected variables vs log(lambda) ----
+# df = number of non-zero coefficients at each lambda (dummy-column level).
+lambda_df <- data.frame(
+  Lambda      = lasso_path_fit$lambda,
+  NonZeroVars = lasso_path_fit$df,
+  LogLambda   = log(lasso_path_fit$lambda)
+)
+
+ref_lambda_df <- data.frame(
+  key    = c("lambda.min", "lambda.1se"),
+  lambda = c(lasso_cv$lambda.min, lasso_cv$lambda.1se)
+)
+
+p_nvars <- ggplot(lambda_df, aes(x = LogLambda, y = NonZeroVars)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_point(color = "steelblue", size = 2) +
+  geom_vline(
+    data = ref_lambda_df,
+    aes(xintercept = log(lambda), color = key),
+    linetype = "dashed", size = 1
+  ) +
+  scale_color_manual(
+    name = NULL,
+    values = c("lambda.min" = "firebrick", "lambda.1se" = "steelblue"),
+    labels = c(
+      "lambda.min" = paste0("lambda.min = ", signif(lasso_cv$lambda.min, 3)),
+      "lambda.1se" = paste0("lambda.1se = ", signif(lasso_cv$lambda.1se, 3))
+    )
+  ) +
+  labs(
+    title = "Number of selected variables vs log(lambda)",
+    x = "log(lambda)", y = "Number of non-zero coefficients"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = c(0.98, 0.98),
+    legend.justification = c(1, 1),
+    legend.background = element_rect(fill = "white", color = "grey80")
+  )
+
+ggsave(file.path(OUT_DIR_FIG, "01c_LASSO_variable_count.png"),
+       p_nvars, width = 8, height = 6, dpi = 300)
+ggsave(file.path(OUT_DIR_FIG, "01c_LASSO_variable_count.pdf"),
+       p_nvars, width = 8, height = 6)
+
+# ---- LASSO cross-validated partial-likelihood deviance ----
+plot_cv_deviance <- function() {
+  plot(lasso_cv)  # plot.cv.glmnet: CV deviance (+/- 1 SE) vs log(lambda)
+  abline(v = log(lasso_cv$lambda.min), col = "firebrick", lty = 2, lwd = 2)
+  abline(v = log(lasso_cv$lambda.1se), col = "steelblue", lty = 2, lwd = 2)
+  legend(
+    "topright",
+    legend = c(
+      paste0("lambda.min = ", signif(lasso_cv$lambda.min, 3)),
+      paste0("lambda.1se = ", signif(lasso_cv$lambda.1se, 3))
+    ),
+    col = c("firebrick", "steelblue"), lty = 2, lwd = 2,
+    cex = 0.85, bty = "o", bg = "white"
+  )
+  title(
+    main = "Partial likelihood deviance vs log(lambda)",
+    xlab = "log(lambda)", ylab = "Partial likelihood deviance"
+  )
+}
+
+png(
+  file.path(OUT_DIR_FIG, "01c_LASSO_cv_deviance.png"),
+  width = 2400, height = 1500, res = 300
+)
+plot_cv_deviance()
+dev.off()
+
+pdf(
+  file.path(OUT_DIR_FIG, "01c_LASSO_cv_deviance.pdf"),
+  width = 10, height = 6
+)
+plot_cv_deviance()
+dev.off()
+
+# Column-subset helper: keep only the columns of a full model matrix that
+# belong to the given original-level variables.
+subset_model_columns <- function(Xm, vars, factor_vars) {
+  cols <- unlist(lapply(vars, function(v) {
+    if (v %in% factor_vars) {
+      grep(paste0("^", v), colnames(Xm), value = TRUE)
+    } else {
+      v
+    }
+  }))
+  cols <- intersect(cols, colnames(Xm))
+  Xm[, cols, drop = FALSE]
+}
+
+# ============================================================
+# 7. 10-FOLD CV
+# ============================================================
+# Stratified by event status.
+# Validation fold is never used to fit preprocessing/model.
+# ============================================================
+
+make_survival_folds <- function(df, k = 10, seed = 1) {
+
+  set.seed(seed)
+
+  event <- df[[EVENT_VAR]]
+
+  fold <- integer(nrow(df))
+
+  for (g in c(0, 1)) {
+
+    idx <- which(event == g)
+
+    idx <- sample(idx)
+
+    fold[idx] <- rep(
+      seq_len(k),
+      length.out = length(idx)
+    )
+  }
+
+  fold
+}
+
+fold_id <- make_survival_folds(
+  development,
+  k = N_FOLDS,
+  seed = SEED_CV
+)
+
+write.csv(
+  tibble(
+    Development_Row = seq_len(nrow(development)),
+    Fold = fold_id
+  ),
+  file.path(OUT_DIR_TXT, "02_Development_10fold_assignment.csv"),
+  row.names = FALSE
+)
+
+# ============================================================
+# ============================================================
+# 8. METRIC FUNCTIONS — FIX7 FINAL
+# ============================================================
+
+calc_cindex <- function(time, event, risk) {
+  ok <- is.finite(time) & !is.na(event) & is.finite(risk)
+  if (sum(ok) < 5) return(NA_real_)
+  z <- tryCatch(
+    survival::concordance(
+      survival::Surv(time[ok], event[ok]) ~ risk[ok],
+      reverse = TRUE
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(z)) return(NA_real_)
+  as.numeric(z$concordance)
+}
+
+# Marginal censoring-survival estimator G(t).
+# Censoring is represented by 1-event. For an event at time t,
+# the IPCW weight uses G(t-) to avoid counting censoring at t.
+make_censor_km <- function(time, event) {
+  fit <- survival::survfit(survival::Surv(time, 1L - event) ~ 1)
+  list(
+    fit = fit,
+    G_right = function(t) {
+      if (!is.finite(t)) return(NA_real_)
+      idx <- findInterval(t, fit$time)
+      if (idx <= 0L) return(1)
+      max(fit$surv[idx], 1e-8)
+    },
+    G_left = function(t) {
+      if (!is.finite(t)) return(NA_real_)
+      idx <- findInterval(t, fit$time, left.open = TRUE)
+      if (idx <= 0L) return(1)
+      max(fit$surv[idx], 1e-8)
+    }
+  )
+}
+
+# Fixed-horizon cumulative/dynamic AUC with marginal IPCW.
+# Cases: death by horizon (T <= t, event=1).
+# Controls: known alive beyond horizon (T > t).
+# Censored before t: excluded by zero IPCW weight.
+# This definition correctly treats OS=91/Censor=0 as a 90-day control.
+calc_horizon_auc_ipcw <- function(time, event, risk, horizon) {
+  time <- as.numeric(time)
+  event <- as.integer(event)
+  risk <- as.numeric(risk)
+  ok <- is.finite(time) & !is.na(event) & is.finite(risk)
+  if (sum(ok) < 10) return(NA_real_)
+  time <- time[ok]; event <- event[ok]; risk <- risk[ok]
+
+  ck <- make_censor_km(time, event)
+  case <- event == 1L & time <= horizon
+  control <- (time > horizon) | (event == 0L & time == horizon)
+  if (!any(case) || !any(control)) return(NA_real_)
+
+  wc <- numeric(length(time)); wn <- numeric(length(time))
+  wc[case] <- vapply(time[case], ck$G_left, numeric(1))
+  wc[case] <- 1 / pmax(wc[case], 1e-8)
+  Gt <- ck$G_left(horizon)
+  wn[control] <- 1 / max(Gt, 1e-8)
+
+  ic <- which(case & is.finite(wc) & wc > 0)
+  in_ <- which(control & is.finite(wn) & wn > 0)
+  if (!length(ic) || !length(in_)) return(NA_real_)
+
+  denom <- sum(wc[ic]) * sum(wn[in_])
+  if (!is.finite(denom) || denom <= 0) return(NA_real_)
+
+  # Weighted Mann–Whitney probability: P(risk_case > risk_control).
+  score <- outer(risk[ic], risk[in_], "-")
+  auc_pair <- (score > 0) + 0.5 * (score == 0)
+  as.numeric(sum((wc[ic] %o% wn[in_]) * auc_pair) / denom)
+}
+
+calc_td_auc <- function(time, event, risk, times) {
+  purrr::map_dfr(times, function(tt) {
+    tibble(Time = tt, AUC = calc_horizon_auc_ipcw(time, event, risk, tt))
+  })
+}
+
+# ============================================================
+# 9. BRIER / IBS — FIX7 FINAL
+# ============================================================
+# IPCW Brier score for binary event-by-horizon outcome.
+#   event by t       -> Y=1, weight 1/G(T-)
+#   known alive at t -> Y=0, weight 1/G(t)
+#   censored before t -> excluded
+# The mean is over the full sample size n (standard IPCW form).
+# ============================================================
+calc_brier_from_surv_matrix <- function(time, event, surv_matrix, pred_times) {
+  time <- as.numeric(time)
+  event <- as.integer(event)
+  surv_matrix <- as.matrix(surv_matrix)
+  n <- length(time)
+  if (nrow(surv_matrix) != n || ncol(surv_matrix) != length(pred_times)) {
+    stop("Brier input dimension mismatch.")
+  }
+
+  ck <- make_censor_km(time, event)
+  out <- vector("list", length(pred_times))
+
+  for (j in seq_along(pred_times)) {
+    tt <- pred_times[j]
+    p <- pmin(pmax(1 - surv_matrix[, j], 0), 1)
+    w <- numeric(n)
+    y <- numeric(n)
+
+    case <- event == 1L & time <= tt
+    control <- (time > tt) | (event == 0L & time == tt)
+
+    if (any(case)) {
+      w[case] <- vapply(time[case], ck$G_left, numeric(1))
+      w[case] <- 1 / pmax(w[case], 1e-8)
+      y[case] <- 1
+    }
+    if (any(control)) {
+      Gt <- ck$G_left(tt)
+      w[control] <- 1 / max(Gt, 1e-8)
+      y[control] <- 0
+    }
+
+    valid <- w > 0 & is.finite(w) & is.finite(p) & is.finite(y)
+    brier <- if (!any(valid)) NA_real_ else sum(w[valid] * (y[valid] - p[valid])^2) / n
+    out[[j]] <- tibble(Time = tt, Brier = brier, N_IPCW = sum(valid))
+  }
+  bind_rows(out)
+}
+
+# ------------------------------------------------------------
+# 9b. CALIBRATION + DCA/SELECTION HELPERS
+# ------------------------------------------------------------
+# These are used by section 24 (Development-based calibration).
+
+fit_risk_calibration <- function(
+    risk,
+    development_df
+) {
+
+  survival::coxph(
+    survival::Surv(
+      development_df[[TIME_VAR]],
+      development_df[[EVENT_VAR]]
+    ) ~ risk,
+    x = TRUE,
+    y = TRUE
+  )
+}
+
+predict_calibrated_mortality <- function(
+    calibration_model,
+    risk,
+    times
+) {
+
+  bh <- survival::basehaz(
+    calibration_model,
+    centered = FALSE
+  )
+
+  out <- matrix(
+    NA_real_,
+    nrow = length(risk),
+    ncol = length(times)
+  )
+
+  for (j in seq_along(times)) {
+
+    tt <- times[j]
+
+    idx <- findInterval(
+      tt,
+      bh$time
+    )
+
+    H0 <- if (
+      idx == 0
+    ) {
+      0
+    } else {
+      bh$hazard[
+        min(
+          idx,
+          nrow(bh)
+        )
+      ]
+    }
+
+    beta <- tryCatch(as.numeric(stats::coef(calibration_model)[1]), error = function(e) NA_real_)
+    if (!is.finite(beta)) {
+      out[, j] <- NA_real_
+    } else {
+      lp <- beta * risk
+      lp <- pmax(pmin(lp, 50), -50)
+      out[, j] <- 1 - exp(-H0 * exp(lp))
+    }
+  }
+
+  colnames(out) <- paste0(
+    "Mortality_",
+    times,
+    "d"
+  )
+
+  out
+}
+
+# IPCW observed event rate at a fixed horizon. This is the raw weighted event
+# rate (used for calibration plots and the bootstrap "CalDiff" mean-calibration
+# metric); it is NOT the intercept-based calibration intercept — that is
+# computed separately by calc_ipcw_calibration_intercept().
+calc_ipcw_observed_risk <- function(time, event, horizon) {
+  time <- as.numeric(time); event <- as.integer(event)
+  ck <- make_censor_km(time, event)
+  case <- event == 1L & time <= horizon
+  control <- (time > horizon) | (event == 0L & time == horizon)
+  w <- numeric(length(time)); y <- rep(NA_real_, length(time))
+  if (any(case)) {
+    w[case] <- vapply(time[case], ck$G_left, numeric(1))
+    w[case] <- 1 / pmax(w[case], 1e-8)
+    y[case] <- 1
+  }
+  if (any(control)) {
+    Gt <- ck$G_left(horizon)
+    w[control] <- 1 / max(Gt, 1e-8)
+    y[control] <- 0
+  }
+  valid <- w > 0 & is.finite(w) & !is.na(y)
+  if (!any(valid)) return(NA_real_)
+  sum(w[valid] * y[valid]) / sum(w[valid])
+}
+
+# Horizon-specific calibration slope (IPCW binary framework).
+#
+# The slope is defined on the BINARY endpoint "death by `horizon`"
+# (1 = died within horizon, 0 = known alive at horizon) and estimated as the
+# coefficient of logit(predicted risk) in a weighted logistic regression of
+# that endpoint on logit(predicted risk), where `p` is the model's predicted
+# horizon-specific mortality probability. Right-censoring is handled by
+# inverse probability of censoring weights (IPCW), using the Kaplan-Meier
+# estimate of the censoring distribution G(.) (censoring indicator = 1-event):
+#
+#   * case    (event = 1, time <= horizon): weight 1 / G(time-), y = 1
+#   * control (time > horizon)            : weight 1 / G(horizon), y = 0
+#   * censored before horizon (event = 0, time <= horizon): the outcome is
+#     UNKNOWN and must NOT be coded as 0 — these patients receive weight 0 and
+#     are excluded from the regression (their information enters via G in the
+#     other two groups' weights).
+#
+# A slope of 1 indicates perfect calibration; slope < 1 over-dispersion of
+# predictions (too extreme), slope > 1 under-fitting. The 28-day and 90-day
+# slopes are computed with distinct horizons and are therefore genuinely
+# horizon-specific.
+calc_calibration_slope <- function(time, event, p, horizon) {
+  time  <- as.numeric(time)
+  event <- as.integer(event)
+  p     <- as.numeric(p)
+
+  ok <- is.finite(time) & !is.na(event) & is.finite(p) & p > 0 & p < 1
+  if (sum(ok) < 20) return(NA_real_)
+
+  t  <- time[ok]
+  e  <- event[ok]
+  pp <- p[ok]
+
+  ck <- make_censor_km(t, e)
+
+  case    <- e == 1L & t <= horizon
+  control <- (t > horizon) | (e == 0L & t == horizon)
+
+  w <- numeric(length(t))
+  y <- rep(NA_integer_, length(t))
+
+  if (any(case)) {
+    w[case] <- vapply(t[case], ck$G_left, numeric(1))
+    w[case] <- 1 / pmax(w[case], 1e-8)
+    y[case] <- 1L
+  }
+  if (any(control)) {
+    Gt <- ck$G_left(horizon)
+    w[control] <- 1 / max(Gt, 1e-8)
+    y[control] <- 0L
+  }
+
+  valid <- w > 0 & is.finite(w) & !is.na(y)
+  if (sum(valid) < 20) return(NA_real_)
+
+  # Both outcome classes must be represented for the logistic slope to be
+  # identified.
+  if (sum(y[valid] == 1L) < 1L || sum(y[valid] == 0L) < 1L) {
+    return(NA_real_)
+  }
+
+  lp <- log(pp[valid] / (1 - pp[valid]))
+
+  fit <- tryCatch(
+    stats::glm(
+      y[valid] ~ lp,
+      family = stats::binomial(link = "logit"),
+      weights = w[valid]
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(fit)) return(NA_real_)
+
+  as.numeric(stats::coef(fit)[2])
+}
+
+# Horizon-specific calibration intercept (calibration-in-the-large, CITL) on
+# the logit scale, estimated as the intercept of an IPCW weighted logistic
+# regression of the horizon-specific binary outcome on the OFFSET
+# logit(predicted risk), i.e. the calibration slope is FIXED at 1:
+#
+#   logit(P(death by horizon)) = calibration_intercept + 1 * logit(predicted)
+#
+# IPCW weights are the same as for the calibration slope: cases 1/G(time-),
+# controls 1/G(horizon), censored-before-horizon weight 0 (outcome unknown,
+# NOT coded as 0). An intercept of 0 indicates no systematic miscalibration;
+# positive = under-prediction (observed risk higher than predicted),
+# negative = over-prediction. 28-day and 90-day intercepts are computed with
+# distinct horizons.
+calc_ipcw_calibration_intercept <- function(time, event, p, horizon) {
+  time  <- as.numeric(time)
+  event <- as.integer(event)
+  p     <- as.numeric(p)
+
+  ok <- is.finite(time) & !is.na(event) & is.finite(p) & p > 0 & p < 1
+  if (sum(ok) < 20) return(NA_real_)
+
+  t  <- time[ok]
+  e  <- event[ok]
+  pp <- p[ok]
+
+  ck <- make_censor_km(t, e)
+
+  case    <- e == 1L & t <= horizon
+  control <- (t > horizon) | (e == 0L & t == horizon)
+
+  w <- numeric(length(t))
+  y <- rep(NA_integer_, length(t))
+
+  if (any(case)) {
+    w[case] <- vapply(t[case], ck$G_left, numeric(1))
+    w[case] <- 1 / pmax(w[case], 1e-8)
+    y[case] <- 1L
+  }
+  if (any(control)) {
+    Gt <- ck$G_left(horizon)
+    w[control] <- 1 / max(Gt, 1e-8)
+    y[control] <- 0L
+  }
+
+  valid <- w > 0 & is.finite(w) & !is.na(y)
+  if (sum(valid) < 20) return(NA_real_)
+
+  if (sum(y[valid] == 1L) < 1L || sum(y[valid] == 0L) < 1L) {
+    return(NA_real_)
+  }
+
+  lp <- log(pp[valid] / (1 - pp[valid]))
+  df_fit <- data.frame(y = y[valid], lp = lp)
+
+  fit <- tryCatch(
+    stats::glm(
+      y ~ offset(lp),
+      data = df_fit,
+      family = stats::binomial(link = "logit"),
+      weights = w[valid]
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(fit)) return(NA_real_)
+
+  as.numeric(stats::coef(fit)[1])
+}
+
+# 10. MODEL FUNCTIONS
+# ============================================================
+
+# ------------------------------------------------------------
+# 10.1 Cox PH
+# ------------------------------------------------------------
+
+fit_cox <- function(X, time, event) {
+
+  df <- data.frame(
+    time = time,
+    event = event,
+    X,
+    check.names = FALSE
+  )
+
+  survival::coxph(
+    survival::Surv(time, event) ~ .,
+    data = df,
+    x = TRUE,
+    y = TRUE,
+    model = TRUE,
+    ties = "efron"
+  )
+}
+
+predict_cox_risk <- function(model, X) {
+
+  as.numeric(
+    stats::predict(
+      model,
+      newdata = as.data.frame(X),
+      type = "lp"
+    )
+  )
+}
+
+# ------------------------------------------------------------
+# 10.2 Elastic Net Cox
+# ------------------------------------------------------------
+
+fit_enet_cox <- function(
+    X,
+    time,
+    event,
+    alpha = 0.5
+) {
+
+  glmnet::cv.glmnet(
+    x = X,
+    y = survival::Surv(time, event),
+    family = "cox",
+    alpha = alpha,
+    nfolds = 10,
+    type.measure = "C",
+    cox.ties = "breslow"
+  )
+}
+
+predict_enet_risk <- function(
+    model,
+    X
+) {
+
+  as.numeric(
+    stats::predict(
+      model,
+      newx = X,
+      s = "lambda.min",
+      type = "link"
+    )
+  )
+}
+
+# ------------------------------------------------------------
+# 10.3 Random Survival Forest
+# ------------------------------------------------------------
+# V2 FIX:
+# Uses ranger x/y interface, NOT formula interface.
+# Therefore illegal formula column names no longer cause the
+# previous error.
+# ------------------------------------------------------------
+
+fit_rsf <- function(
+    X,
+    time,
+    event,
+    mtry = NULL,
+    min_node_size = 15,
+    num_trees = 800
+) {
+
+  X <- as.data.frame(
+    X,
+    check.names = FALSE
+  )
+
+  if (is.null(mtry)) {
+    mtry <- max(
+      1,
+      floor(sqrt(ncol(X)))
+    )
+  }
+
+  ranger::ranger(
+    x = X,
+    y = survival::Surv(
+      time,
+      event
+    ),
+    num.trees = num_trees,
+    mtry = min(
+      mtry,
+      ncol(X)
+    ),
+    min.node.size = min_node_size,
+    splitrule = "logrank",
+    importance = "permutation",
+    seed = SEED_MODEL
+  )
+}
+
+predict_rsf_survival <- function(
+    model,
+    X,
+    pred_times
+) {
+
+  pr <- predict(
+    model,
+    data = as.data.frame(X)
+  )
+
+  surv <- pr$survival
+  death_times <- pr$unique.death.times
+
+  if (length(death_times) == 0) {
+
+    return(
+      matrix(
+        1,
+        nrow = nrow(X),
+        ncol = length(pred_times)
+      )
+    )
+  }
+
+  out <- matrix(
+    NA_real_,
+    nrow = nrow(X),
+    ncol = length(pred_times)
+  )
+
+  for (j in seq_along(pred_times)) {
+
+    tt <- pred_times[j]
+
+    idx <- findInterval(
+      tt,
+      death_times
+    )
+
+    if (idx == 0) {
+      out[, j] <- 1
+    } else {
+      out[, j] <- surv[, idx]
+    }
+  }
+
+  out
+}
+
+predict_rsf_risk <- function(
+    model,
+    X,
+    ref_time = 90
+) {
+
+  s <- predict_rsf_survival(
+    model,
+    X,
+    ref_time
+  )
+
+  as.numeric(
+    1 - s[, 1]
+  )
+}
+
+# ------------------------------------------------------------
+# 10.4 XGBoost survival
+# ------------------------------------------------------------
+# xgboost 3.x supports survival:cox.
+# We use survival:cox and treat predictions as relative risk
+# scores. Absolute survival calibration is performed separately.
+# ------------------------------------------------------------
+
+fit_xgb_surv <- function(
+    X,
+    time,
+    event,
+    max_depth = 3,
+    eta = 0.03,
+    min_child_weight = 5,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    nrounds = 400
+) {
+
+  dtrain <- xgboost::xgb.DMatrix(
+    data = X,
+    label = time
+  )
+
+  # For xgboost survival:cox:
+  # positive label = event time
+  # negative label = censored time
+  xgboost::setinfo(
+    dtrain,
+    "label",
+    ifelse(
+      event == 1,
+      time,
+      -time
+    )
+  )
+
+  xgboost::xgb.train(
+    params = list(
+      objective = "survival:cox",
+      eval_metric = "cox-nloglik",
+      max_depth = max_depth,
+      eta = eta,
+      min_child_weight = min_child_weight,
+      subsample = subsample,
+      colsample_bytree = colsample_bytree,
+      nthread = 2
+    ),
+    data = dtrain,
+    nrounds = nrounds,
+    verbose = 0
+  )
+}
+
+predict_xgb_risk <- function(
+    model,
+    X
+) {
+
+  as.numeric(
+    stats::predict(
+      model,
+      newdata = X
+    )
+  )
+}
+
+# ============================================================
+# 11. RSF TUNING
+# ============================================================
+
+tune_rsf <- function(
+    df,
+    fold_id,
+    n_folds
+) {
+
+  n_feats <- length(
+    fit_preprocessor(
+      df,
+      predictor_vars,
+      factor_vars
+    )$columns
+  )
+
+  mtry_candidates <- unique(
+    pmax(
+      1,
+      pmin(
+        n_feats,
+        c(
+          floor(sqrt(n_feats)),
+          floor(n_feats * 0.2),
+          floor(n_feats * 0.4)
+        )
+      )
+    )
+  )
+
+  grid <- expand.grid(
+    mtry = mtry_candidates,
+    min_node_size = 15
+  )
+
+  results <- vector(
+    "list",
+    nrow(grid)
+  )
+
+  for (g in seq_len(nrow(grid))) {
+
+    message(
+      "RSF tuning ",
+      g,
+      "/",
+      nrow(grid)
+    )
+
+    fold_scores <- numeric(n_folds)
+
+    for (k in seq_len(n_folds)) {
+
+      tr <- which(fold_id != k)
+      va <- which(fold_id == k)
+
+      # Fold-specific preprocessing.
+      prep <- fit_preprocessor(
+        df[tr, , drop = FALSE],
+        predictor_vars,
+        factor_vars
+      )
+
+      Xtr <- apply_preprocessor(
+        prep,
+        df[tr, , drop = FALSE],
+        scale = TRUE
+      )
+
+      Xva <- apply_preprocessor(
+        prep,
+        df[va, , drop = FALSE],
+        scale = TRUE
+      )
+
+      fit <- fit_rsf(
+        Xtr,
+        df[[TIME_VAR]][tr],
+        df[[EVENT_VAR]][tr],
+        mtry = grid$mtry[g],
+        min_node_size = grid$min_node_size[g],
+        num_trees = 300
+      )
+
+      risk <- predict_rsf_risk(
+        fit,
+        Xva,
+        ref_time = min(
+          90,
+          max(df[[TIME_VAR]][tr])
+        )
+      )
+
+      fold_scores[k] <- calc_cindex(
+        df[[TIME_VAR]][va],
+        df[[EVENT_VAR]][va],
+        risk
+      )
+    }
+
+    results[[g]] <- tibble(
+      mtry = grid$mtry[g],
+      min_node_size = grid$min_node_size[g],
+      Mean_C_index = mean(
+        fold_scores,
+        na.rm = TRUE
+      ),
+      SD_C_index = stats::sd(
+        fold_scores,
+        na.rm = TRUE
+      )
+    )
+  }
+
+  bind_rows(results)
+}
+
+# ============================================================
+# 12. XGBOOST TUNING
+# ============================================================
+
+tune_xgb <- function(
+    df,
+    fold_id,
+    n_folds
+) {
+
+  grid <- expand.grid(
+    max_depth = c(3, 5),
+    eta = c(0.02, 0.05),
+    min_child_weight = c(3, 10),
+    nrounds = 500
+  )
+
+  results <- vector(
+    "list",
+    nrow(grid)
+  )
+
+  for (g in seq_len(nrow(grid))) {
+
+    message(
+      "XGBoost tuning ",
+      g,
+      "/",
+      nrow(grid)
+    )
+
+    fold_scores <- numeric(n_folds)
+
+    for (k in seq_len(n_folds)) {
+
+      tr <- which(fold_id != k)
+      va <- which(fold_id == k)
+
+      prep <- fit_preprocessor(
+        df[tr, , drop = FALSE],
+        predictor_vars,
+        factor_vars
+      )
+
+      Xtr <- apply_preprocessor(
+        prep,
+        df[tr, , drop = FALSE],
+        scale = TRUE
+      )
+
+      Xva <- apply_preprocessor(
+        prep,
+        df[va, , drop = FALSE],
+        scale = TRUE
+      )
+
+      fit <- fit_xgb_surv(
+        Xtr,
+        df[[TIME_VAR]][tr],
+        df[[EVENT_VAR]][tr],
+        max_depth = grid$max_depth[g],
+        eta = grid$eta[g],
+        min_child_weight = grid$min_child_weight[g],
+        nrounds = grid$nrounds[g]
+      )
+
+      risk <- predict_xgb_risk(
+        fit,
+        Xva
+      )
+
+      fold_scores[k] <- calc_cindex(
+        df[[TIME_VAR]][va],
+        df[[EVENT_VAR]][va],
+        risk
+      )
+    }
+
+    results[[g]] <- tibble(
+      max_depth = grid$max_depth[g],
+      eta = grid$eta[g],
+      min_child_weight = grid$min_child_weight[g],
+      nrounds = grid$nrounds[g],
+      Mean_C_index = mean(
+        fold_scores,
+        na.rm = TRUE
+      ),
+      SD_C_index = stats::sd(
+        fold_scores,
+        na.rm = TRUE
+      )
+    )
+  }
+
+  bind_rows(results)
+}
+
+# ============================================================
+# 13. DEVELOPMENT-ONLY HYPERPARAMETER TUNING
+# ============================================================
+# A single DEVELOPMENT-only CV (fold_id / N_FOLDS) over the FULL development
+# set selects the hyperparameters (rsf_best / xgb_best) that the final locked
+# models (section 18) are refitted with. This defines the deployed model.
+# This CV is a hyperparameter-tuning tool ONLY — it does NOT generate or save
+# any held-out prediction matrix.
+#
+# TEST remains locked throughout.
+# ============================================================
+
+message("")
+message("====================================================")
+message("DEVELOPMENT ONLY: HYPERPARAMETER TUNING")
+message("TEST remains LOCKED")
+message("====================================================")
+
+rsf_tuning <- tune_rsf(
+  development,
+  fold_id,
+  N_FOLDS
+)
+
+xgb_tuning <- tune_xgb(
+  development,
+  fold_id,
+  N_FOLDS
+)
+
+write.csv(
+  rsf_tuning,
+  file.path(
+    OUT_DIR_TXT,
+    "03_RSF_CV_tuning.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  xgb_tuning,
+  file.path(
+    OUT_DIR_TXT,
+    "03_XGBoost_survival_CV_tuning.csv"
+  ),
+  row.names = FALSE
+)
+
+rsf_best <- rsf_tuning |>
+  arrange(desc(Mean_C_index)) |>
+  slice(1)
+
+xgb_best <- xgb_tuning |>
+  arrange(desc(Mean_C_index)) |>
+  slice(1)
+
+write.csv(
+  rsf_best,
+  file.path(
+    OUT_DIR_TXT,
+    "03_RSF_best_parameters.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  xgb_best,
+  file.path(
+    OUT_DIR_TXT,
+    "03_XGBoost_best_parameters.csv"
+  ),
+  row.names = FALSE
+)
+
+# ============================================================
+# 18. FIT FINAL MODELS ON ALL DEVELOPMENT
+# ============================================================
+# At this point:
+#   - tuning complete
+#
+# TEST is STILL untouched.
+#
+# Final base models are now refitted using all DEVELOPMENT.
+# ============================================================
+
+message("")
+message("====================================================")
+message("FINAL MODEL LOCK")
+message("Refitting final models on ALL DEVELOPMENT")
+message("TEST has not been used")
+message("====================================================")
+
+# --- Final models are ALWAYS refitted from the raw data -----------------
+# This run does NOT load any historical RDS (no fallback): the final base
+# models and MICE object are all refitted from the current data. RDS files
+# are only SAVED (below and in section 19) as backup/intermediate-result
+# records, never auto-read to skip re-fitting.
+RDS_BASE  <- file.path(OUT_DIR_RDS, "05_FINAL_LOCKED_BASE_MODELS.rds")
+RDS_MICE  <- file.path(OUT_DIR_RDS, "05_FINAL_MICE_object.rds")
+
+message("No historical RDS is loaded this run; all models are refitted from the current data.")
+
+# ---- MICE on FULL development ------------------------------
+dev_mice_obj <- fit_mice(
+  development,
+  predictor_vars,
+  factor_vars
+)
+
+Xdev_list <- mice_complete_matrices(dev_mice_obj$mids, prep_full)
+
+# Reduced matrices for Cox / Elastic Net (LASSO-selected variables only).
+Xdev_list_ce <- lapply(
+  Xdev_list,
+  function(Xm) subset_model_columns(Xm, cox_enet_vars, factor_vars)
+)
+
+y_dev_time  <- development[[TIME_VAR]]
+y_dev_event <- development[[EVENT_VAR]]
+
+final_models <- list()
+
+final_models$Cox <- lapply(Xdev_list_ce, function(Xm) {
+  fit_cox(Xm, y_dev_time, y_dev_event)
+})
+
+final_models$ElasticNet_Cox <- lapply(Xdev_list_ce, function(Xm) {
+  fit_enet_cox(Xm, y_dev_time, y_dev_event, alpha = 0.5)
+})
+
+final_models$RSF <- lapply(Xdev_list, function(Xm) {
+  fit_rsf(
+    Xm, y_dev_time, y_dev_event,
+    mtry = rsf_best$mtry,
+    min_node_size = rsf_best$min_node_size,
+    num_trees = 1000
+  )
+})
+
+final_models$XGBoost <- lapply(Xdev_list, function(Xm) {
+  fit_xgb_surv(
+    Xm, y_dev_time, y_dev_event,
+    max_depth = xgb_best$max_depth,
+    eta = xgb_best$eta,
+    min_child_weight = xgb_best$min_child_weight,
+    nrounds = xgb_best$nrounds
+  )
+})
+
+# Save the MICE object + imputed development matrices.
+saveRDS(
+  list(dev_mice_obj = dev_mice_obj, Xdev_list = Xdev_list),
+  RDS_MICE
+)
+
+# Representative single-model views (imputation 1) for interpretation
+# (Cox HR, RSF importance). These are NOT used for performance evaluation,
+# which averages predictions over all M imputations.
+rep_models <- list(
+  Cox            = final_models$Cox[[1]],
+  ElasticNet_Cox = final_models$ElasticNet_Cox[[1]],
+  RSF            = final_models$RSF[[1]],
+  XGBoost        = final_models$XGBoost[[1]]
+)
+
+# ============================================================
+# 18a. SHAP FEATURE IMPORTANCE (XGBoost + RSF TreeSHAP, imputation 1)
+# ============================================================
+# XGBoost SHAP uses the native TreeSHAP (xgboost predcontrib=TRUE) on the
+# DEVELOPMENT set with the imputation-1 representative model/matrix (same
+# convention as rep_models / Cox HR / RSF importance). Interpretation only —
+# not part of performance evaluation.
+#
+#   - XGBoost target = log-hazard risk (survival:cox margin) -> SHAP in
+#     log-hazard-ratio units (additive on the relative-risk scale).
+#   - One-hot dummies (sex_name, cirrhosis_etiology) are collapsed back to the
+#     original predictors by summing their SHAP contributions.
+#   - RSF SHAP uses native TreeSHAP via treeshap::ranger_surv.unify(type="risk")
+#     on the risk-score (sum of cumulative hazards) scale — exact, not a proxy.
+#     (ranger permutation importance is additionally reported in section 31.)
+# ============================================================
+
+# Collapse one-hot dummies back to the original predictors (sum contributions).
+collapse_dummies <- function(S, col_names) {
+  S_agg <- matrix(
+    0, nrow = nrow(S), ncol = length(predictor_vars),
+    dimnames = list(NULL, predictor_vars)
+  )
+  for (v in predictor_vars) {
+    cols <- if (v %in% factor_vars) {
+      grep(paste0("^", v), col_names, value = TRUE)
+    } else {
+      v
+    }
+    cols <- intersect(cols, col_names)
+    if (length(cols) > 0L) S_agg[, v] <- rowSums(S[, cols, drop = FALSE])
+  }
+  S_agg
+}
+
+# Build SHAP values (CSV) + beeswarm/bar plots for a single model.
+# Returns the two ggplots (list(beeswarm=, bar=)); they are combined into ONE
+# 2x2 figure below, so the per-model single PNGs are no longer saved separately.
+write_shap_outputs <- function(S_agg, baseline, model_tag, raw_X) {
+  shv <- shapviz::shapviz(S_agg, X = raw_X, baseline = baseline)
+
+  write.csv(
+    S_agg,
+    file.path(OUT_DIR_TXT, paste0("12_SHAP_", model_tag, "_values.csv")),
+    row.names = FALSE, fileEncoding = "UTF-8"
+  )
+
+  p_bee <- shapviz::sv_importance(shv, kind = "beeswarm", max_display = 33L) +
+    labs(title = paste0("SHAP — ", model_tag, " (Development, imputation 1)"))
+  p_bar <- shapviz::sv_importance(shv, kind = "bar", max_display = 33L) +
+    labs(title = paste0("SHAP importance — ", model_tag, " (Development, imputation 1)"))
+
+  list(beeswarm = p_bee, bar = p_bar)
+}
+
+shap_plots <- list()
+
+tryCatch({
+  if (requireNamespace("xgboost", quietly = TRUE) &&
+      requireNamespace("shapviz", quietly = TRUE)) {
+
+    set.seed(SEED_MODEL)
+    Xmm    <- Xdev_list[[1]]
+    n_row  <- nrow(Xmm)
+    ex_idx <- sample.int(n_row, min(200L, n_row))
+
+    # Raw imputed (unstandardised) feature values for the beeswarm colour scale.
+    dev_imp1 <- mice::complete(dev_mice_obj$mids, 1)
+    raw_X <- dev_imp1[ex_idx, predictor_vars, drop = FALSE]
+    for (v in factor_vars) raw_X[[v]] <- factor(as.character(raw_X[[v]]))
+
+    # ---- XGBoost: native TreeSHAP (exact, single-pass) --------------------
+    message("SHAP [XGBoost]: TreeSHAP (predcontrib), explain = ", length(ex_idx),
+            " (imputation 1)")
+    shap_mat <- stats::predict(
+      rep_models$XGBoost,
+      newdata = as.matrix(Xmm[ex_idx, , drop = FALSE]),
+      predcontrib = TRUE
+    )
+    # Last column is the bias (baseline); the rest are additive SHAP contributions.
+    baseline <- shap_mat[1, ncol(shap_mat)]
+    S <- shap_mat[, -ncol(shap_mat), drop = FALSE]
+
+    S_agg <- collapse_dummies(S, colnames(S))
+    shap_plots[["XGBoost"]] <- write_shap_outputs(S_agg, baseline, "XGBoost", raw_X)
+
+    # ---- RSF: native TreeSHAP via treeshap (ranger_surv.unify, type="risk") --
+    # risk = sum of cumulative hazards over all death times (exact, not a proxy).
+    if (requireNamespace("treeshap", quietly = TRUE)) {
+      message("SHAP [RSF]: TreeSHAP (treeshap, risk scale), explain = ",
+              length(ex_idx), " (imputation 1)")
+      rsf_unified <- treeshap::ranger_surv.unify(
+        rep_models$RSF,
+        as.data.frame(Xmm, check.names = FALSE),
+        type = "risk"
+      )
+      rsf_shap <- treeshap::treeshap(
+        rsf_unified,
+        as.data.frame(Xmm[ex_idx, , drop = FALSE], check.names = FALSE)
+      )
+      S_rsf <- as.matrix(rsf_shap$shaps)
+      # baseline = mean risk score over the reference (full development) matrix.
+      baseline_rsf <- mean(
+        as.numeric(stats::predict(rsf_unified, as.data.frame(Xmm, check.names = FALSE)))
+      )
+      S_rsf_agg <- collapse_dummies(S_rsf, colnames(S_rsf))
+      shap_plots[["RSF"]] <- write_shap_outputs(S_rsf_agg, baseline_rsf, "RSF", raw_X)
+    } else {
+      message("SHAP [RSF]: skipped - treeshap is not installed.")
+    }
+
+  } else {
+    message("xgboost / shapviz not installed; skipping SHAP.")
+  }
+}, error = function(e) {
+  message("SHAP computation failed (skipped; does not affect the rest of the analysis): ", conditionMessage(e))
+})
+
+# Combine all SHAP plots into a single 2x2 figure (rows = model, cols = kind:
+# beeswarm | bar). Single-model PNGs are no longer saved — only this combined
+# PNG + PDF.
+if (length(shap_plots) > 0L && requireNamespace("patchwork", quietly = TRUE)) {
+  n_model <- length(shap_plots)
+  comb <- do.call(patchwork::wrap_plots, c(
+    unlist(lapply(shap_plots, function(x) list(x$beeswarm, x$bar)), recursive = FALSE),
+    list(ncol = 2L, byrow = TRUE)
+  ))
+  comb_w <- 16
+  comb_h <- 10 * n_model
+  ggsave(file.path(OUT_DIR_FIG, "12_SHAP_combined.png"),
+         comb, width = comb_w, height = comb_h, dpi = 300)
+  ggsave(file.path(OUT_DIR_FIG, "12_SHAP_combined.pdf"),
+         comb, width = comb_w, height = comb_h)
+} else if (length(shap_plots) > 0L) {
+  message("patchwork not installed; skipping the combined SHAP plot (CSV was written).")
+}
+
+# ============================================================
+# 18b. DEVELOPMENT APPARENT BASE PREDICTIONS
+# ============================================================
+# Base-learner risk predictions on the FULL development cohort (apparent /
+# in-sample). Used for the Development-side performance summary, calibration
+# cutpoints, DCA and classification thresholds (sections 21b-29b); all such
+# parameters are learned from DEVELOPMENT only and applied to the locked TEST
+# set. RSF additionally produces native horizon-specific survival curves.
+# ============================================================
+
+model_names <- c(
+  "Cox",
+  "ElasticNet_Cox",
+  "RSF",
+  "XGBoost"
+)
+
+avg_dev_pred <- function(fit_list, X_list, predfun, ...) {
+  M <- length(fit_list)
+  r <- matrix(NA_real_, nrow = nrow(X_list[[1]]), ncol = M)
+  for (mm in seq_len(M)) {
+    r[, mm] <- predfun(fit_list[[mm]], X_list[[mm]], ...)
+  }
+  apply(r, 1, function(x) {
+    if (all(!is.finite(x))) NA_real_ else mean(x, na.rm = TRUE)
+  })
+}
+
+dev_pred <- matrix(
+  NA_real_,
+  nrow = nrow(development),
+  ncol = length(model_names),
+  dimnames = list(NULL, model_names)
+)
+
+dev_pred[, "Cox"] <- avg_dev_pred(
+  final_models$Cox, Xdev_list_ce, predict_cox_risk
+)
+
+dev_pred[, "ElasticNet_Cox"] <- avg_dev_pred(
+  final_models$ElasticNet_Cox, Xdev_list_ce, predict_enet_risk
+)
+
+dev_pred[, "XGBoost"] <- avg_dev_pred(
+  final_models$XGBoost, Xdev_list, predict_xgb_risk
+)
+
+ref_time_dev <- min(90, max(y_dev_time))
+
+dev_pred[, "RSF"] <- avg_dev_pred(
+  final_models$RSF, Xdev_list, predict_rsf_risk, ref_time = ref_time_dev
+)
+
+# Development-side native RSF survival (horizon-specific, apparent / in-sample).
+# RSF outputs absolute survival curves, so its 28-day and 90-day mortality are
+# distinct native predictions; used for RSF calibration / Brier / DCA below.
+dev_rsf_surv_arr <- array(
+  NA_real_,
+  dim = c(nrow(development), length(PRED_TIMES), MICE_M)
+)
+for (mm in seq_len(MICE_M)) {
+  dev_rsf_surv_arr[, , mm] <- predict_rsf_survival(
+    final_models$RSF[[mm]], Xdev_list[[mm]], PRED_TIMES
+  )
+}
+dev_rsf_surv <- apply(dev_rsf_surv_arr, c(1, 2), mean, na.rm = TRUE)
+colnames(dev_rsf_surv) <- paste0("Survival_", PRED_TIMES, "d")
+
+
+# ============================================================
+# 19. SAVE LOCKED FINAL MODELS
+# ============================================================
+
+saveRDS(
+  final_models,
+  file.path(
+    OUT_DIR_RDS,
+    "05_FINAL_LOCKED_BASE_MODELS.rds"
+  )
+)
+
+# ============================================================
+# 20. TEST IS OPENED ONLY NOW
+# ============================================================
+
+message("")
+message("====================================================")
+message("CHINESE EXTERNAL VALIDATION: FINAL INDEPENDENT EVALUATION")
+message("====================================================")
+
+# ------------------------------------------------------------
+# TEST predictions
+# ------------------------------------------------------------
+
+M <- MICE_M
+
+# Impute TEST via the locked development MICE model (mice.mids newdata
+# continuation). STRICT: any failure is a hard stop (no median/mode fallback),
+# because Development uses MICE and TEST must be imputed identically.
+# predict_mice imputes from TEST baseline predictors only — no OS / event /
+# Nelson-Aalen or any outcome-derived information enters the imputation model.
+Xtest_list <- tryCatch(
+  predict_mice(dev_mice_obj, test_set, prep_full),
+  error = function(e) e
+)
+
+if (inherits(Xtest_list, "error")) {
+  stop(
+    "TEST MICE imputation failed: ", conditionMessage(Xtest_list),
+    ". No median/mode fallback is used — aborting."
+  )
+}
+
+# Strict structural validation of the imputed TEST matrices.
+n_test_rows <- nrow(test_set)
+dev_cols <- colnames(X_dev)
+if (!is.list(Xtest_list) || length(Xtest_list) != M) {
+  stop(
+    "TEST MICE returned ", length(Xtest_list),
+    " imputed matrices (expected ", M, ")."
+  )
+}
+for (mm in seq_len(M)) {
+  Xm <- Xtest_list[[mm]]
+  if (!is.matrix(Xm)) {
+    stop("TEST MICE imputation ", mm, " is not a matrix.")
+  }
+  if (nrow(Xm) != n_test_rows) {
+    stop(
+      "TEST MICE imputation ", mm, " has ", nrow(Xm),
+      " rows (expected ", n_test_rows, ")."
+    )
+  }
+  if (!identical(colnames(Xm), dev_cols)) {
+    stop(
+      "TEST MICE imputation ", mm,
+      " column names do not match the Development model matrix."
+    )
+  }
+}
+
+# Reduced TEST matrices for Cox / Elastic Net (LASSO-selected variables only).
+Xtest_list_ce <- lapply(
+  Xtest_list,
+  function(Xm) subset_model_columns(Xm, cox_enet_vars, factor_vars)
+)
+
+ref_time <- min(90, max(development[[TIME_VAR]]))
+
+average_pred <- function(fit_list, predfun, X_list = Xtest_list, ...) {
+  r <- matrix(NA_real_, nrow = nrow(X_list[[1]]), ncol = M)
+  for (mm in seq_len(M)) {
+    r[, mm] <- predfun(fit_list[[mm]], X_list[[mm]], ...)
+  }
+  apply(r, 1, function(x) {
+    if (all(!is.finite(x))) NA_real_ else mean(x, na.rm = TRUE)
+  })
+}
+
+test_risk <- list()
+
+test_risk$Cox <- average_pred(
+  final_models$Cox, predict_cox_risk, X_list = Xtest_list_ce
+)
+
+test_risk$ElasticNet_Cox <- average_pred(
+  final_models$ElasticNet_Cox,
+  predict_enet_risk,
+  X_list = Xtest_list_ce
+)
+
+test_risk$XGBoost <- average_pred(final_models$XGBoost, predict_xgb_risk)
+
+# RSF risk averaged over M (one fit per imputation). RSF also returns native
+# horizon-specific survival curves; the 28-day and 90-day mortality risks are
+# DISTINCT (non-proportional hazards), so both are computed here and used for
+# horizon-correct discrimination (section 21) and calibration / Brier / DCA
+# (sections 23-29b). A single 90-day risk is NOT substituted for the 28-day risk.
+rsf_risk_arr <- matrix(
+  NA_real_, nrow = nrow(Xtest_list[[1]]), ncol = M
+)
+rsf_test_surv_arr <- array(
+  NA_real_,
+  dim = c(nrow(Xtest_list[[1]]), length(PRED_TIMES), M)
+)
+for (mm in seq_len(M)) {
+  rsf_risk_arr[, mm] <- predict_rsf_risk(
+    final_models$RSF[[mm]],
+    Xtest_list[[mm]],
+    ref_time = ref_time
+  )
+  rsf_test_surv_arr[, , mm] <- predict_rsf_survival(
+    final_models$RSF[[mm]],
+    Xtest_list[[mm]],
+    PRED_TIMES
+  )
+}
+test_risk$RSF <- apply(rsf_risk_arr, 1, function(x) {
+  if (all(!is.finite(x))) NA_real_ else mean(x, na.rm = TRUE)
+})
+
+test_rsf_surv <- apply(
+  rsf_test_surv_arr,
+  c(1, 2),
+  mean,
+  na.rm = TRUE
+)
+colnames(test_rsf_surv) <- paste0("Survival_", PRED_TIMES, "d")
+
+test_rsf_mortality <- 1 - test_rsf_surv
+colnames(test_rsf_mortality) <- paste0("Mortality_", PRED_TIMES, "d")
+
+# ------------------------------------------------------------
+# MELD / MELD-Na (UNOS) - conventional ACLF prognostic-score baselines
+# ------------------------------------------------------------
+# Bilirubin/creatinine are already in conventional units (mg/dL); sodium in mmol/L; INR unitless.
+# MELD/MELD-Na are single time-independent scores; once added to test_risk / dev_risk,
+# they are automatically included in the C-index, AUC, and bootstrap CI of sections 21 / 21b / 26b.
+calc_meld <- function(bili, inr, cr) {
+  bili <- pmax(bili, 1); inr <- pmax(inr, 1); cr <- pmin(pmax(cr, 1), 4)
+  3.78 * log(bili) + 11.2 * log(inr) + 9.57 * log(cr) + 6.43
+}
+calc_meld_na <- function(meld, na) {
+  na <- pmin(pmax(na, 125), 137)
+  meld - na - 0.025 * meld * (140 - na) + 140
+}
+# Missing-value filling for MELD uses the DEVELOPMENT medians as the locked
+# reference (same principle as the locked development MICE model in section 20):
+# the external TEST set must NOT be filled from its own distribution, otherwise
+# the validation score would leak TEST information. Both DEV and TEST are
+# therefore filled with the DEVELOPMENT medians.
+dev_med_bili <- median(development$bilirubin_total, na.rm = TRUE)
+dev_med_inr  <- median(development$inr,          na.rm = TRUE)
+dev_med_cr   <- median(development$creatinine,   na.rm = TRUE)
+dev_med_na   <- median(development$sodium,       na.rm = TRUE)
+
+fill_median <- function(x, m) { x[is.na(x)] <- m; x }
+
+test_meld    <- calc_meld(fill_median(test_set$bilirubin_total, dev_med_bili),
+                          fill_median(test_set$inr,          dev_med_inr),
+                          fill_median(test_set$creatinine,   dev_med_cr))
+test_meld_na <- calc_meld_na(test_meld, fill_median(test_set$sodium, dev_med_na))
+dev_meld     <- calc_meld(fill_median(development$bilirubin_total, dev_med_bili),
+                          fill_median(development$inr,          dev_med_inr),
+                          fill_median(development$creatinine,   dev_med_cr))
+dev_meld_na  <- calc_meld_na(dev_meld, fill_median(development$sodium, dev_med_na))
+
+test_risk$MELD      <- test_meld
+test_risk$`MELD-Na` <- test_meld_na
+
+# ============================================================
+# 21. TEST C-INDEX + TIME-DEPENDENT AUC
+# ============================================================
+
+test_metrics <- map_dfr(
+  names(test_risk),
+  function(nm) {
+
+    risk <- test_risk[[nm]]
+
+    # RSF is non-proportional: its 28-day and 90-day risks are DISTINCT native
+    # quantities (1 - S(t)), so the horizon-specific mortality is used for each
+    # time-dependent AUC. A single 90-day risk is NOT substituted for the
+    # 28-day risk. (PH models use one horizon-invariant linear-predictor risk.)
+    if (nm == "RSF") {
+      auc_28 <- calc_horizon_auc_ipcw(
+        test_set[[TIME_VAR]], test_set[[EVENT_VAR]],
+        test_rsf_mortality[, "Mortality_28d"], 28
+      )
+      auc_90 <- calc_horizon_auc_ipcw(
+        test_set[[TIME_VAR]], test_set[[EVENT_VAR]],
+        test_rsf_mortality[, "Mortality_90d"], 90
+      )
+    } else {
+      auc <- calc_td_auc(
+        test_set[[TIME_VAR]],
+        test_set[[EVENT_VAR]],
+        risk,
+        PRED_TIMES
+      )
+      auc_28 <- auc$AUC[match(28, auc$Time)]
+      auc_90 <- auc$AUC[match(90, auc$Time)]
+    }
+
+    tibble(
+      Model = nm,
+      C_index = calc_cindex(
+        test_set[[TIME_VAR]],
+        test_set[[EVENT_VAR]],
+        risk
+      ),
+      AUC_28d = auc_28,
+      AUC_90d = auc_90
+    )
+  }
+)
+
+write.csv(
+  test_metrics,
+  file.path(
+    OUT_DIR_TXT,
+    "06_TEST_FINAL_discrimination_28_90.csv"
+  ),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+print(test_metrics)
+
+# ============================================================
+# 21b. TRAIN vs VALIDATION PERFORMANCE SUMMARY
+# ============================================================
+# Training set = development cohort (apparent / in-sample, not cross-fitted)
+# Validation set = external validation cohort (independent external validation, evaluated after model lock)
+# Summarise the C-index and 28/90-day AUC of both cohorts side by side.
+
+dev_risk <- list(
+  Cox                    = dev_pred[, "Cox"],
+  ElasticNet_Cox         = dev_pred[, "ElasticNet_Cox"],
+  RSF                    = dev_pred[, "RSF"],
+  XGBoost                = dev_pred[, "XGBoost"],
+  MELD                   = dev_meld,
+  `MELD-Na`              = dev_meld_na
+)
+
+dev_metrics <- map_dfr(names(dev_risk), function(nm) {
+  risk <- dev_risk[[nm]]
+  if (nm == "RSF") {
+    auc_28 <- calc_horizon_auc_ipcw(
+      y_dev_time, y_dev_event, 1 - dev_rsf_surv[, "Survival_28d"], 28
+    )
+    auc_90 <- calc_horizon_auc_ipcw(
+      y_dev_time, y_dev_event, 1 - dev_rsf_surv[, "Survival_90d"], 90
+    )
+  } else {
+    auc <- calc_td_auc(y_dev_time, y_dev_event, risk, PRED_TIMES)
+    auc_28 <- auc$AUC[match(28, auc$Time)]
+    auc_90 <- auc$AUC[match(90, auc$Time)]
+  }
+  tibble(
+    Model = nm,
+    C_index = calc_cindex(y_dev_time, y_dev_event, risk),
+    AUC_28d = auc_28,
+    AUC_90d = auc_90
+  )
+})
+
+# Combine training/validation into one wide table (one row per model, columns labelled by cohort).
+perf_summary <- dev_metrics |>
+  inner_join(test_metrics, by = "Model",
+             suffix = c("_Development", "_External_validation"))
+perf_cols <- c(
+  "Model",
+  "C_index_Development", "C_index_External_validation",
+  "AUC_28d_Development", "AUC_28d_External_validation",
+  "AUC_90d_Development", "AUC_90d_External_validation"
+)
+perf_summary <- perf_summary[, perf_cols, drop = FALSE]
+for (cc in setdiff(perf_cols, "Model")) {
+  perf_summary[[cc]] <- round(perf_summary[[cc]], 3)
+}
+
+write.csv(
+  perf_summary,
+  file.path(OUT_DIR_TXT, "06b_TRAIN_VALID_performance_summary.csv"),
+  row.names = FALSE, fileEncoding = "UTF-8"
+)
+print(perf_summary)
+
+# ============================================================
+# TRAIN + VALIDATION TIME-DEPENDENT ROC - 4-panel figure (28d / 90d x train / validation)
+# ============================================================
+# Cumulative/dynamic ROC, marginal IPCW (case/control defined as for AUC). Higher risk score =
+# higher predicted mortality probability, curve above the diagonal. RSF uses the horizon-specific 1 - S(t)
+# (non-proportional hazards); the other models (including MELD / MELD-Na) use a single time-independent risk score.
+
+roc_curve_ipcw <- function(time, event, risk, horizon) {
+  time <- as.numeric(time); event <- as.integer(event); risk <- as.numeric(risk)
+  ok <- is.finite(time) & !is.na(event) & is.finite(risk)
+  time <- time[ok]; event <- event[ok]; risk <- risk[ok]
+
+  ck <- make_censor_km(time, event)
+  case <- event == 1L & time <= horizon
+  control <- (time > horizon) | (event == 0L & time == horizon)
+  if (!any(case) || !any(control)) return(NULL)
+
+  w <- numeric(length(time))
+  w[case] <- vapply(time[case], ck$G_left, numeric(1))
+  w[case] <- 1 / pmax(w[case], 1e-8)
+  Gt <- ck$G_left(horizon)
+  w[control] <- 1 / max(Gt, 1e-8)
+
+  ic <- which(case & is.finite(w) & w > 0)
+  in_ <- which(control & is.finite(w) & w > 0)
+  if (!length(ic) || !length(in_)) return(NULL)
+
+  wc <- w[ic]; rc <- risk[ic]
+  wn <- w[in_]; rn <- risk[in_]
+  swc <- sum(wc); swn <- sum(wn)
+
+  # Thresholds from +Inf (nobody positive) to -Inf (everybody positive).
+  th <- c(Inf, sort(unique(risk), decreasing = TRUE), -Inf)
+  tpr <- vapply(th, function(c) sum(wc[rc >= c]) / swc, numeric(1))
+  fpr <- vapply(th, function(c) sum(wn[rn >= c]) / swn, numeric(1))
+
+  tibble(Threshold = th, TPR = tpr, FPR = fpr)
+}
+
+# Horizon-specific mortality probability (1 - S(t)) from the development RSF.
+dev_rsf_mort_roc <- 1 - dev_rsf_surv
+colnames(dev_rsf_mort_roc) <- paste0("Mortality_", PRED_TIMES, "d")
+
+roc_build <- function(time, event, risk_list, rsf_mort, horizons, dataset_label) {
+  out <- list()
+  for (nm in names(risk_list)) {
+    for (tt in horizons) {
+      risk <- if (nm == "RSF") rsf_mort[, paste0("Mortality_", tt, "d")] else risk_list[[nm]]
+      cd <- roc_curve_ipcw(time, event, risk, tt)
+      if (is.null(cd)) next
+      cd$Model <- nm; cd$Time <- tt
+      cd$AUC <- calc_horizon_auc_ipcw(time, event, risk, tt)
+      out[[length(out) + 1L]] <- cd
+    }
+  }
+  df <- bind_rows(out); df$Dataset <- dataset_label; df
+}
+
+roc_dev  <- roc_build(development[[TIME_VAR]], development[[EVENT_VAR]], dev_risk, dev_rsf_mort_roc, PRED_TIMES, "Development (apparent)")
+roc_test <- roc_build(test_set[[TIME_VAR]], test_set[[EVENT_VAR]], test_risk, test_rsf_mortality, PRED_TIMES, "Test (external)")
+roc_df <- bind_rows(roc_dev, roc_test)
+
+write.csv(
+  roc_df,
+  file.path(OUT_DIR_TXT, "06_TRAIN_TEST_ROC_curve_data_28_90.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+# Display labels (internal name -> display name).
+roc_risk_labels <- c(
+  MELD = "MELD", `MELD-Na` = "MELD-Na", Cox = "Cox",
+  ElasticNet_Cox = "ElasticNet", XGBoost = "XGBoost",
+  RSF = "RSF"
+)
+roc_df$Model <- factor(
+  roc_risk_labels[as.character(roc_df$Model)],
+  levels = c("MELD", "MELD-Na", "Cox", "ElasticNet", "XGBoost", "RSF")
+)
+roc_df$Time_lab <- factor(paste0(roc_df$Time, "-day"), levels = c("28-day", "90-day"))
+
+# Per-panel AUC annotation (one text label per panel).
+roc_auc_txt <- roc_df |>
+  group_by(Time_lab, Dataset, Model) |>
+  summarise(AUC = AUC[1], .groups = "drop") |>
+  arrange(Model) |>
+  group_by(Time_lab, Dataset) |>
+  summarise(Txt = paste0(sprintf("%s: %.3f", Model, AUC), collapse = "\n"),
+            .groups = "drop")
+
+roc_colors <- c(
+  MELD = "#AA3377", `MELD-Na` = "#D55E00", Cox = "#4477AA",
+  ElasticNet = "#EE6677", XGBoost = "#228833", RSF = "#CCBB44"
+)
+
+if (nrow(roc_df) > 0) {
+  p_roc <- ggplot(roc_df, aes(x = FPR, y = TPR, color = Model)) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey60") +
+    geom_line(linewidth = 0.8) +
+    geom_text(
+      data = roc_auc_txt, aes(x = 0.55, y = 0.02, label = Txt),
+      inherit.aes = FALSE, hjust = 0, vjust = 0,
+      size = 2.4, lineheight = 0.95, color = "black"
+    ) +
+    facet_grid(Time_lab ~ Dataset) +
+    coord_equal() +
+    scale_x_continuous(breaks = seq(0, 1, 0.25), limits = c(0, 1)) +
+    scale_y_continuous(breaks = seq(0, 1, 0.25), limits = c(0, 1)) +
+    scale_color_manual(values = roc_colors) +
+    theme_classic(base_size = 11) +
+    theme(
+      legend.position = "bottom", legend.title = element_blank(),
+      strip.text = element_text(face = "bold"),
+      panel.spacing = unit(0.8, "lines")
+    ) +
+    labs(x = "1 - Specificity", y = "Sensitivity")
+
+  ggsave(
+    file.path(OUT_DIR_FIG, "MELD_MELDNa_vs_ML_ROC_4panel.png"),
+    p_roc, width = 9, height = 7.5, dpi = 300
+  )
+  ggsave(
+    file.path(OUT_DIR_FIG, "MELD_MELDNa_vs_ML_ROC_4panel.pdf"),
+    p_roc, width = 9, height = 7.5
+  )
+}
+
+# ============================================================
+# 22. TEST PREDICTION TABLE
+# ============================================================
+
+test_prediction_table <- tibble(
+  Test_Row = seq_len(nrow(test_set)),
+  OS = test_set[[TIME_VAR]],
+  Death = test_set[[EVENT_VAR]]
+)
+
+for (nm in names(test_risk)) {
+  test_prediction_table[[nm]] <- test_risk[[nm]]
+}
+
+write.csv(
+  test_prediction_table,
+  file.path(
+    OUT_DIR_TXT,
+    "06_TEST_predictions_28_90.csv"
+  ),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+# ============================================================
+# 23. SURVIVAL PROBABILITIES FOR RSF
+# ============================================================
+# RSF naturally produces survival curves.
+# This is the strictest direct survival prediction available
+# among the models in this pipeline.
+#
+# test_rsf_surv / test_rsf_mortality were computed in section 20 (native
+# horizon-specific survival, 28-day and 90-day distinct).
+# dev_rsf_surv was computed from the FULL-development RSF predictions in
+# section 18b (apparent / in-sample, NOT out-of-fold).
+# ============================================================
+
+# Development-side native RSF mortality (horizon-specific, apparent). RSF
+# outputs absolute survival curves, so its 28-day and 90-day mortality are
+# distinct native predictions; these are used (instead of a single fixed
+# 90-day risk) for the RSF calibration, Brier and DCA below.
+dev_rsf_mortality <- 1 - dev_rsf_surv
+colnames(dev_rsf_mortality) <- paste0("Mortality_", PRED_TIMES, "d")
+
+rsf_probability_table <- tibble(
+  Test_Row = seq_len(nrow(test_set))
+)
+
+for (j in seq_along(PRED_TIMES)) {
+
+  rsf_probability_table[[paste0("Predicted_Mortality_", PRED_TIMES[j], "d")]] <- test_rsf_mortality[, j]
+
+  rsf_probability_table[[paste0("Predicted_Survival_", PRED_TIMES[j], "d")]] <- test_rsf_surv[, j]
+}
+
+write.csv(
+  rsf_probability_table,
+  file.path(
+    OUT_DIR_TXT,
+    "06_TEST_RSF_survival_probabilities_28_90.csv"
+  ),
+  row.names = FALSE
+)
+
+# ============================================================
+# 24. DEVELOPMENT-BASED CALIBRATION OF RISK SCORES
+# ============================================================
+# For ML models whose direct output is a relative risk score,
+# absolute mortality probability is estimated using a Cox
+# calibration model fitted on DEVELOPMENT predictions.
+#
+# Independence / bias note:
+#   - Base models: the calibration model is fitted on the
+#     FULL-development (apparent / in-sample) predictions. This is APPARENT
+#     calibration and may be optimistically biased; it is NOT an unbiased
+#     internal calibration estimate.
+#   - RSF: uses its native horizon-specific survival probabilities
+#     directly (section 23), so no recalibration is needed.
+# TEST is not used to fit calibration.
+# ============================================================
+
+calibration_models <- list()
+test_calibrated_prob <- list()
+
+for (nm in names(test_risk)) {
+
+  # RSF already outputs absolute horizon-specific survival/mortality
+  # probabilities (section 23); it is NOT passed through the Cox
+  # risk -> mortality recalibration below, so its 28-day and 90-day
+  # predictions remain distinct native quantities.
+  # MELD / MELD-Na are raw prognostic scores but are passed through the
+  # same Cox calibration as the other risk-score models (Cox/ENet/XGBoost),
+  # so they enter the Brier / DCA / classification pipeline on equal footing.
+  if (nm == "RSF") next
+
+  risk_dev <- dev_risk[[nm]]
+
+  cal_fit <- tryCatch(
+    fit_risk_calibration(
+      risk_dev,
+      development
+    ),
+    error = function(e) NULL
+  )
+
+  if (!is.null(cal_fit)) {
+
+    calibration_models[[nm]] <- cal_fit
+
+    test_calibrated_prob[[nm]] <-
+      predict_calibrated_mortality(
+        cal_fit,
+        test_risk[[nm]],
+        PRED_TIMES
+      )
+  }
+}
+
+# RSF native horizon-specific mortality (28-day and 90-day distinct).
+test_calibrated_prob$RSF <- test_rsf_mortality
+
+saveRDS(
+  calibration_models,
+  file.path(
+    OUT_DIR_RDS,
+    "07_DEVELOPMENT_calibration_models_28_90.rds"
+  )
+)
+
+
+# ============================================================
+# ============================================================
+# 25. TEST CALIBRATION — FIX7 FINAL
+# ============================================================
+# Calibration is performed on the independent TEST set, but all
+# risk-group cut points are learned from DEVELOPMENT apparent predictions.
+# Each model/time point contributes multiple calibration points.
+#
+# Procedure:
+#   DEVELOPMENT apparent risk -> development-derived tertile cutpoints
+#   TEST calibrated mortality -> fixed tertile groups
+#   observed TEST mortality -> IPCW estimate within each group
+#
+# No TEST information is used to choose cutpoints or fit calibration.
+# Cut points come from FULL-development (apparent) predictions for the base
+# models, and from native RSF survival (see section 23).
+# ============================================================
+
+calibration_summary <- list()
+
+# For each model/time, derive tertiles from DEVELOPMENT apparent calibrated
+# probabilities, not from TEST.
+for (nm in names(test_calibrated_prob)) {
+  if (nm == "RSF") {
+    dev_prob <- dev_rsf_mortality
+  } else {
+    risk_dev <- dev_risk[[nm]]
+    cal_fit <- calibration_models[[nm]]
+    if (is.null(cal_fit)) next
+    dev_prob <- predict_calibrated_mortality(cal_fit, risk_dev, PRED_TIMES)
+  }
+  test_prob <- test_calibrated_prob[[nm]]
+
+  for (j in seq_along(PRED_TIMES)) {
+    tt <- PRED_TIMES[j]
+    q <- stats::quantile(dev_prob[, j], probs = c(0, 1/3, 2/3, 1), na.rm = TRUE, names = FALSE)
+    q <- unique(q)
+    if (length(q) < 4L) next
+
+    grp <- cut(test_prob[, j], breaks = q, include.lowest = TRUE, labels = FALSE)
+    for (g in seq_len(length(q) - 1L)) {
+      ii <- which(grp == g)
+      if (length(ii) < 5L) next
+      observed <- calc_ipcw_observed_risk(
+        test_set[[TIME_VAR]][ii], test_set[[EVENT_VAR]][ii], tt
+      )
+      calibration_summary[[length(calibration_summary) + 1L]] <- tibble(
+        Model = nm,
+        Prediction_Type = "External validation",
+        Time = tt,
+        Risk_Group = paste0("Tertile_", g),
+        N = length(ii),
+        Mean_Predicted_Mortality = mean(test_prob[ii, j], na.rm = TRUE),
+        Observed_IPCW_Mortality = observed
+      )
+    }
+  }
+}
+
+calibration_df <- bind_rows(calibration_summary)
+write.csv(calibration_df,
+          file.path(OUT_DIR_TXT, "07_TEST_calibration_summary_28_90.csv"),
+          row.names = FALSE, fileEncoding = "UTF-8")
+
+# ---- Smooth external calibration curve (IPCW, natural spline) ----
+# The tertile table above (calibration_df) is the tabular summary; the figure
+# below shows the CONTINUOUS predicted-vs-observed calibration curve. A
+# natural-spline logistic regression of the IPCW-weighted binary endpoint on
+# logit(predicted mortality) is the standard smooth external-calibration curve
+# (equivalent to riskRegression::calPlot / pec::calPlot). The spline is a
+# DESCRIPTIVE tool applied to the locked TEST predictions — no prognostic model
+# is refitted — and censoring is handled by the same marginal IPCW weights used
+# throughout (§8/§9). A predicted-risk histogram (spine) at the panel bottom
+# shows where the curve is supported by data.
+calc_smooth_calibration <- function(time, event, p, horizon, df = 3, n_grid = 100) {
+  time <- as.numeric(time); event <- as.integer(event); p <- as.numeric(p)
+  ok <- is.finite(time) & !is.na(event) & is.finite(p) & p > 0 & p < 1
+  if (sum(ok) < 30) return(NULL)
+  t <- time[ok]; e <- event[ok]; pp <- p[ok]
+
+  ck <- make_censor_km(t, e)
+  case    <- e == 1L & t <= horizon
+  control <- (t > horizon) | (e == 0L & t == horizon)
+  w <- numeric(length(t)); y <- rep(NA_integer_, length(t))
+  if (any(case)) {
+    w[case] <- 1 / pmax(vapply(t[case], ck$G_left, numeric(1)), 1e-8)
+    y[case] <- 1L
+  }
+  if (any(control)) {
+    Gt <- ck$G_left(horizon)
+    w[control] <- 1 / max(Gt, 1e-8)
+    y[control] <- 0L
+  }
+  valid <- w > 0 & is.finite(w) & !is.na(y)
+  if (sum(valid) < 30) return(NULL)
+  if (sum(y[valid] == 1L) < 1L || sum(y[valid] == 0L) < 1L) return(NULL)
+
+  lp <- log(pp[valid] / (1 - pp[valid]))
+  fit <- tryCatch(
+    stats::glm(
+      y[valid] ~ splines::ns(lp, df = df),
+      family = stats::binomial(link = "logit"),
+      weights = w[valid]
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(fit)) return(NULL)
+
+  grid_lp <- seq(min(lp), max(lp), length.out = n_grid)
+  obs <- stats::predict(fit, newdata = data.frame(lp = grid_lp), type = "response")
+  data.frame(
+    Predicted = 1 / (1 + exp(-grid_lp)),
+    Observed  = as.numeric(obs)
+  )
+}
+
+cal_smooth_list <- list()
+cal_spine_list  <- list()
+for (nm in names(test_calibrated_prob)) {
+  for (j in seq_along(PRED_TIMES)) {
+    tt <- PRED_TIMES[j]
+    pvec <- test_calibrated_prob[[nm]][, j]
+    cur <- calc_smooth_calibration(
+      test_set[[TIME_VAR]], test_set[[EVENT_VAR]], pvec, tt
+    )
+    if (!is.null(cur)) {
+      cur$Model <- nm; cur$Time <- tt
+      cal_smooth_list[[length(cal_smooth_list) + 1L]] <- cur
+    }
+    hh <- graphics::hist(pvec, breaks = seq(0, 1, length.out = 21), plot = FALSE)
+    cal_spine_list[[length(cal_spine_list) + 1L]] <- data.frame(
+      Model = nm, Time = tt, x = hh$mids, h = hh$counts
+    )
+  }
+}
+
+if (length(cal_smooth_list) > 0L) {
+  cal_smooth_df <- bind_rows(cal_smooth_list)
+  cal_spine_df  <- bind_rows(cal_spine_list)
+  cal_smooth_df$Time_lab <- factor(paste0(cal_smooth_df$Time, "-day"),
+                                   levels = c("28-day", "90-day"))
+  cal_spine_df$Time_lab  <- factor(paste0(cal_spine_df$Time, "-day"),
+                                   levels = c("28-day", "90-day"))
+
+  cal_model_labels <- c(Cox = "Cox", ElasticNet_Cox = "ElasticNet",
+                        XGBoost = "XGBoost", RSF = "RSF")
+  cal_smooth_df$Model_lab <- cal_model_labels[cal_smooth_df$Model]
+  cal_spine_df$Model_lab  <- cal_model_labels[cal_spine_df$Model]
+
+  # Spine: predicted-risk histogram rescaled to the bottom 18% of the panel.
+  cal_spine_df <- cal_spine_df |>
+    group_by(Model_lab, Time_lab) |>
+    mutate(h_scaled = h / max(h) * 0.18) |>
+    ungroup()
+
+  p_cal <- ggplot(cal_smooth_df, aes(x = Predicted, y = Observed)) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey50") +
+    geom_segment(
+      data = cal_spine_df,
+      aes(x = x, xend = x, y = 0, yend = h_scaled),
+      inherit.aes = FALSE, color = "grey75"
+    ) +
+    geom_line(aes(color = Model_lab), linewidth = 0.9) +
+    coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+    facet_grid(Model_lab ~ Time_lab) +
+    scale_color_manual(values = c(Cox = "#4477AA", ElasticNet = "#EE6677",
+                                  XGBoost = "#228833", RSF = "#CCBB44")) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "none", strip.text = element_text(face = "bold")) +
+    labs(title = "Independent TEST Calibration — 28-day and 90-day Mortality",
+         x = "Predicted mortality", y = "Observed mortality (IPCW)")
+
+  ggsave(file.path(OUT_DIR_FIG, "07_TEST_calibration_28_90.png"),
+         p_cal, width = 9, height = 9, dpi = 300)
+  ggsave(file.path(OUT_DIR_FIG, "07_TEST_calibration_28_90.pdf"),
+         p_cal, width = 9, height = 9)
+}
+
+# ============================================================
+# 26. BRIER SCORE (28/90-DAY) — FIX7 FINAL
+# ============================================================
+# RSF uses its native survival probabilities.
+# Other models use absolute horizon-specific mortality probabilities
+# obtained from DEVELOPMENT (apparent) Cox calibration.
+#
+# Mean_Brier_28_90 is the simple mean of the 28-day and 90-day IPCW Brier
+# scores (NOT an integrated Brier score / IBS), per the fixed naming.
+# ============================================================
+
+brier_results <- list()
+
+brier_rsf <- calc_brier_from_surv_matrix(
+  time = test_set[[TIME_VAR]],
+  event = test_set[[EVENT_VAR]],
+  surv_matrix = test_rsf_surv,
+  pred_times = PRED_TIMES
+)
+brier_rsf$Model <- "RSF"
+brier_results[[length(brier_results) + 1L]] <- brier_rsf
+
+for (nm in names(test_calibrated_prob)) {
+  if (nm == "RSF") next
+  p <- test_calibrated_prob[[nm]]
+  b <- calc_brier_from_surv_matrix(
+    time = test_set[[TIME_VAR]],
+    event = test_set[[EVENT_VAR]],
+    surv_matrix = 1 - p,
+    pred_times = PRED_TIMES
+  )
+  b$Model <- nm
+  brier_results[[length(brier_results) + 1L]] <- b
+}
+
+brier_df <- bind_rows(brier_results) |>
+  select(Model, Time, Brier, N_IPCW)
+
+write.csv(brier_df,
+          file.path(OUT_DIR_TXT, "08_TEST_Brier_scores_28_90.csv"),
+          row.names = FALSE, fileEncoding = "UTF-8")
+
+brier_summary_df <- brier_df |>
+  group_by(Model) |>
+  summarise(
+    Mean_Brier_28_90 = mean(Brier, na.rm = TRUE),
+    .groups = "drop"
+  )
+write.csv(brier_summary_df,
+          file.path(OUT_DIR_TXT, "08_TEST_Brier_summary_28_90.csv"),
+          row.names = FALSE, fileEncoding = "UTF-8")
+
+# ============================================================
+# 26b. TEST 95% CONFIDENCE INTERVALS — BOOTSTRAP (FINAL ONLY)
+# ============================================================
+# The external validation (TEST) set point estimates are complemented
+# with bootstrap 95% CIs (percentile method) to quantify sampling
+# uncertainty of the independent evaluation.
+#
+# IMPORTANT: bootstrap resamples the TEST evaluation set only. The
+# locked model predictions are held fixed — no model is refitted and no
+# hyperparameter / cutoff / calibration parameter is re-tuned. Bootstrap
+# is used solely to quantify sampling uncertainty of the final
+# independent performance estimates.
+# ============================================================
+
+BOOTSTRAP_B <- 2000
+
+bootstrap_test_ci <- function(B = BOOTSTRAP_B, seed = SEED_MODEL) {
+  n <- nrow(test_set)
+  time <- test_set[[TIME_VAR]]
+  event <- test_set[[EVENT_VAR]]
+
+  disc_models <- names(test_risk)
+
+  # Survival matrices for Brier scoring: RSF native survival + calibrated
+  # mortality (converted to survival) for every other calibrated model.
+  surv_mats <- list()
+  surv_mats[["RSF"]] <- test_rsf_surv
+  for (nm in setdiff(names(test_calibrated_prob), "RSF")) {
+    surv_mats[[nm]] <- 1 - test_calibrated_prob[[nm]]
+  }
+
+  metric_names <- c(
+    unlist(lapply(disc_models, function(nm)
+      paste0(nm, c("_C_index", "_AUC_28d", "_AUC_90d")))),
+    unlist(lapply(names(surv_mats), function(nm)
+      paste0(nm, c("_Brier_28d", "_Brier_90d")))),
+    unlist(lapply(names(test_calibrated_prob), function(nm)
+      paste0(nm, "_CalDiff_", PRED_TIMES, "d"))),
+    unlist(lapply(names(test_calibrated_prob), function(nm)
+      paste0(nm, "_CITL_", PRED_TIMES, "d")))
+  )
+
+  boot_mat <- matrix(
+    NA_real_, nrow = B, ncol = length(metric_names),
+    dimnames = list(NULL, metric_names)
+  )
+
+  set.seed(seed)
+  for (b in seq_len(B)) {
+    idx <- sample.int(n, replace = TRUE)
+    tb <- time[idx]; eb <- event[idx]
+
+    for (nm in disc_models) {
+      r <- test_risk[[nm]][idx]
+      boot_mat[b, paste0(nm, "_C_index")] <- calc_cindex(tb, eb, r)
+      if (nm == "RSF") {
+        # RSF: horizon-specific risk (1 - S(t)), not a single 90-day risk.
+        boot_mat[b, paste0(nm, "_AUC_28d")] <- calc_horizon_auc_ipcw(
+          tb, eb, 1 - test_rsf_surv[idx, "Survival_28d"], 28
+        )
+        boot_mat[b, paste0(nm, "_AUC_90d")] <- calc_horizon_auc_ipcw(
+          tb, eb, 1 - test_rsf_surv[idx, "Survival_90d"], 90
+        )
+      } else {
+        auc <- calc_td_auc(tb, eb, r, PRED_TIMES)
+        boot_mat[b, paste0(nm, "_AUC_28d")] <- auc$AUC[match(28, auc$Time)]
+        boot_mat[b, paste0(nm, "_AUC_90d")] <- auc$AUC[match(90, auc$Time)]
+      }
+    }
+
+    for (nm in names(surv_mats)) {
+      sm <- surv_mats[[nm]][idx, , drop = FALSE]
+      bs <- calc_brier_from_surv_matrix(tb, eb, sm, PRED_TIMES)
+      boot_mat[b, paste0(nm, "_Brier_28d")] <- bs$Brier[match(28, bs$Time)]
+      boot_mat[b, paste0(nm, "_Brier_90d")] <- bs$Brier[match(90, bs$Time)]
+    }
+
+    for (nm in names(test_calibrated_prob)) {
+      p <- test_calibrated_prob[[nm]][idx, , drop = FALSE]
+      for (j in seq_along(PRED_TIMES)) {
+        tt <- PRED_TIMES[j]
+        obs <- calc_ipcw_observed_risk(tb, eb, tt)
+        # CalDiff = observed-minus-predicted mean-calibration difference
+        # (kept as a complementary metric, NOT a calibration intercept).
+        boot_mat[b, paste0(nm, "_CalDiff_", tt, "d")] <-
+          obs - mean(p[, j], na.rm = TRUE)
+        # Strict IPCW calibration intercept (CITL): glm(y ~ offset(logit p),
+        # weights = IPCW), slope fixed at 1. Refit on this bootstrap sample.
+        boot_mat[b, paste0(nm, "_CITL_", tt, "d")] <-
+          calc_ipcw_calibration_intercept(tb, eb, p[, j], tt)
+      }
+    }
+  }
+
+  # Point estimates on the full (unresampled) locked TEST set.
+  point <- setNames(numeric(length(metric_names)), metric_names)
+  for (nm in disc_models) {
+    r <- test_risk[[nm]]
+    point[paste0(nm, "_C_index")] <- calc_cindex(time, event, r)
+    if (nm == "RSF") {
+      point[paste0(nm, "_AUC_28d")] <- calc_horizon_auc_ipcw(
+        time, event, 1 - test_rsf_surv[, "Survival_28d"], 28
+      )
+      point[paste0(nm, "_AUC_90d")] <- calc_horizon_auc_ipcw(
+        time, event, 1 - test_rsf_surv[, "Survival_90d"], 90
+      )
+    } else {
+      auc <- calc_td_auc(time, event, r, PRED_TIMES)
+      point[paste0(nm, "_AUC_28d")] <- auc$AUC[match(28, auc$Time)]
+      point[paste0(nm, "_AUC_90d")] <- auc$AUC[match(90, auc$Time)]
+    }
+  }
+  for (nm in names(surv_mats)) {
+    bs <- calc_brier_from_surv_matrix(time, event, surv_mats[[nm]], PRED_TIMES)
+    point[paste0(nm, "_Brier_28d")] <- bs$Brier[match(28, bs$Time)]
+    point[paste0(nm, "_Brier_90d")] <- bs$Brier[match(90, bs$Time)]
+  }
+  for (nm in names(test_calibrated_prob)) {
+    p <- test_calibrated_prob[[nm]]
+    for (j in seq_along(PRED_TIMES)) {
+      tt <- PRED_TIMES[j]
+      point[paste0(nm, "_CalDiff_", tt, "d")] <-
+        calc_ipcw_observed_risk(time, event, tt) - mean(p[, j], na.rm = TRUE)
+      point[paste0(nm, "_CITL_", tt, "d")] <-
+        calc_ipcw_calibration_intercept(time, event, p[, j], tt)
+    }
+  }
+
+  map_dfr(metric_names, function(mn) {
+    v <- boot_mat[, mn]
+    v <- v[is.finite(v)]
+    if (length(v) < 2) {
+      return(tibble(
+        Metric = mn,
+        Point_Estimate = NA_real_,
+        CI_Lower = NA_real_,
+        CI_Upper = NA_real_,
+        B_valid = length(v)
+      ))
+    }
+    tibble(
+      Metric = mn,
+      Point_Estimate = as.numeric(point[mn]),
+      CI_Lower = as.numeric(stats::quantile(v, 0.025, na.rm = TRUE)),
+      CI_Upper = as.numeric(stats::quantile(v, 0.975, na.rm = TRUE)),
+      B_valid = length(v)
+    )
+  })
+}
+
+test_bootstrap_ci <- bootstrap_test_ci(B = BOOTSTRAP_B, seed = SEED_MODEL)
+
+write.csv(
+  test_bootstrap_ci,
+  file.path(OUT_DIR_TXT, "08b_TEST_bootstrap_95CI.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+# ============================================================
+# 26c. DEV 95% CONFIDENCE INTERVALS — BOOTSTRAP (APPARENT)
+# ============================================================
+# Same percentile bootstrap as the TEST set, applied to the DEVELOPMENT
+# cohort's locked (apparent / in-sample) predictions. NOTE: these CIs
+# quantify sampling uncertainty of the apparent estimate only — they are
+# NOT optimism-corrected (the models were fit on this cohort). Discrimination
+# metrics only (C-index, 28/90-day AUC), matching the TRAIN_VALID summary.
+
+bootstrap_dev_ci <- function(B = BOOTSTRAP_B, seed = SEED_MODEL) {
+  n <- nrow(development)
+  time <- development[[TIME_VAR]]
+  event <- development[[EVENT_VAR]]
+
+  disc_models <- names(dev_risk)
+
+  metric_names <- unlist(lapply(disc_models, function(nm)
+    paste0(nm, c("_C_index", "_AUC_28d", "_AUC_90d"))))
+
+  boot_mat <- matrix(
+    NA_real_, nrow = B, ncol = length(metric_names),
+    dimnames = list(NULL, metric_names)
+  )
+
+  set.seed(seed)
+  for (b in seq_len(B)) {
+    idx <- sample.int(n, replace = TRUE)
+    tb <- time[idx]; eb <- event[idx]
+
+    for (nm in disc_models) {
+      r <- dev_risk[[nm]][idx]
+      boot_mat[b, paste0(nm, "_C_index")] <- calc_cindex(tb, eb, r)
+      if (nm == "RSF") {
+        boot_mat[b, paste0(nm, "_AUC_28d")] <- calc_horizon_auc_ipcw(
+          tb, eb, 1 - dev_rsf_surv[idx, "Survival_28d"], 28
+        )
+        boot_mat[b, paste0(nm, "_AUC_90d")] <- calc_horizon_auc_ipcw(
+          tb, eb, 1 - dev_rsf_surv[idx, "Survival_90d"], 90
+        )
+      } else {
+        auc <- calc_td_auc(tb, eb, r, PRED_TIMES)
+        boot_mat[b, paste0(nm, "_AUC_28d")] <- auc$AUC[match(28, auc$Time)]
+        boot_mat[b, paste0(nm, "_AUC_90d")] <- auc$AUC[match(90, auc$Time)]
+      }
+    }
+  }
+
+  point <- setNames(numeric(length(metric_names)), metric_names)
+  for (nm in disc_models) {
+    r <- dev_risk[[nm]]
+    point[paste0(nm, "_C_index")] <- calc_cindex(time, event, r)
+    if (nm == "RSF") {
+      point[paste0(nm, "_AUC_28d")] <- calc_horizon_auc_ipcw(
+        time, event, 1 - dev_rsf_surv[, "Survival_28d"], 28
+      )
+      point[paste0(nm, "_AUC_90d")] <- calc_horizon_auc_ipcw(
+        time, event, 1 - dev_rsf_surv[, "Survival_90d"], 90
+      )
+    } else {
+      auc <- calc_td_auc(time, event, r, PRED_TIMES)
+      point[paste0(nm, "_AUC_28d")] <- auc$AUC[match(28, auc$Time)]
+      point[paste0(nm, "_AUC_90d")] <- auc$AUC[match(90, auc$Time)]
+    }
+  }
+
+  map_dfr(metric_names, function(mn) {
+    v <- boot_mat[, mn]
+    v <- v[is.finite(v)]
+    if (length(v) < 2) {
+      return(tibble(
+        Metric = mn,
+        Point_Estimate = NA_real_,
+        CI_Lower = NA_real_,
+        CI_Upper = NA_real_,
+        B_valid = length(v)
+      ))
+    }
+    tibble(
+      Metric = mn,
+      Point_Estimate = as.numeric(point[mn]),
+      CI_Lower = as.numeric(stats::quantile(v, 0.025, na.rm = TRUE)),
+      CI_Upper = as.numeric(stats::quantile(v, 0.975, na.rm = TRUE)),
+      B_valid = length(v)
+    )
+  })
+}
+
+dev_bootstrap_ci <- bootstrap_dev_ci(B = BOOTSTRAP_B, seed = SEED_MODEL)
+
+write.csv(
+  dev_bootstrap_ci,
+  file.path(OUT_DIR_TXT, "08b_DEV_bootstrap_95CI.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+# ============================================================
+# 27. RISK STRATIFICATION (RSF, APPARENT DEV CUTPOINTS)
+# ============================================================
+# Risk-group tertile cutpoints are learned from the RSF model's
+# apparent (in-sample) Development risk (dev_pred[, "RSF"], section 18b).
+# These cutpoints are on the same scale as the locked TEST RSF risk because
+# both are produced by the SAME locked RSF model. TEST is NOT used to
+# determine cutpoints.
+#
+# NOTE: the Development RSF risk is apparent (in-sample), so the tertile
+# cutpoints themselves may be optimistically separated; the KM discrimination
+# shown below is on the independent TEST set.
+# ============================================================
+
+dev_risk_quantiles <- stats::quantile(
+  dev_pred[, "RSF"],
+  probs = c(1 / 3, 2 / 3),
+  na.rm = TRUE,
+  names = FALSE
+)
+
+test_strat_risk <- test_risk$RSF
+
+test_risk_group <- cut(
+  test_strat_risk,
+  breaks = c(-Inf, dev_risk_quantiles[1], dev_risk_quantiles[2], Inf),
+  labels = c("Low", "Intermediate", "High"),
+  include.lowest = TRUE
+)
+
+risk_group_table <- tibble(
+  Test_Row = seq_len(nrow(test_set)),
+  RSF_Risk = test_strat_risk,
+  Risk_Group = test_risk_group
+)
+
+write.csv(
+  risk_group_table,
+  file.path(OUT_DIR_TXT, "09_TEST_locked_risk_groups.csv"),
+  row.names = FALSE
+)
+
+# ============================================================
+# 28. KAPLAN-MEIER BY RISK GROUP (TEST)
+# ============================================================
+
+km_data <- tibble(
+  OS = test_set[[TIME_VAR]],
+  Death = test_set[[EVENT_VAR]],
+  Risk_Group = test_risk_group
+)
+
+km_fit <- survival::survfit(
+  survival::Surv(OS, Death) ~ Risk_Group,
+  data = km_data
+)
+
+gg_km <- survminer::ggsurvplot(
+  km_fit,
+  data = km_data,
+  palette = c("#4477AA", "#EEBB44", "#CC3311"),
+  risk.table = TRUE,
+  risk.table.height = 0.25,
+  conf.int = TRUE,
+  pval = TRUE,
+  pval.method = TRUE,
+  xlim = c(0, 90),
+  break.time.by = 15,
+  xlab = "Follow-up time (days)",
+  ylab = "Survival probability",
+  censor = TRUE,
+  legend.title = "Risk group",
+  legend.labs = c("Low", "Intermediate", "High"),
+  ggtheme = theme_classic(base_size = 12),
+  risk.table.y.text.col = TRUE,
+  fontsize = 3.2
+)
+
+png(
+  file.path(OUT_DIR_FIG, "09_TEST_Kaplan_Meier_risk_groups.png"),
+  width = 9, height = 7.5, units = "in", res = 300
+)
+print(gg_km)
+dev.off()
+
+pdf(
+  file.path(OUT_DIR_FIG, "09_TEST_Kaplan_Meier_risk_groups.pdf"),
+  width = 9, height = 7.5
+)
+print(gg_km)
+dev.off()
+
+logrank <- survival::survdiff(
+  survival::Surv(OS, Death) ~ Risk_Group,
+  data = km_data
+)
+
+logrank_p <- 1 - stats::pchisq(
+  logrank$chisq,
+  df = length(logrank$n) - 1
+)
+
+km_result <- tibble(
+  ChiSquare = logrank$chisq,
+  P_value = logrank_p
+)
+
+write.csv(
+  km_result,
+  file.path(OUT_DIR_TXT, "09_TEST_KM_logrank.csv"),
+  row.names = FALSE
+)
+
+# ---- Export per-group survival / mortality rates and median survival ----
+# S(t) at 28/90 days is read from the KM fit via summary(..., times = ...).
+# summary() lays surv out strata-major (each group's times contiguous), so we
+# reshape into a [n_groups x n_times] matrix row-wise.
+km_summ <- summary(km_fit, times = c(28, 90), extend = TRUE)
+grp_names <- sub("Risk_Group=", "", names(km_fit$strata))
+n_grp <- length(grp_names)
+surv_mat <- matrix(km_summ$surv, nrow = n_grp, byrow = TRUE)
+median_surv <- summary(km_fit)$table[, "median"]
+
+risk_group_summary <- tibble(
+  Risk_Group = grp_names,
+  N = as.integer(km_fit$n),
+  Surv_28d = surv_mat[, 1],
+  Surv_90d = surv_mat[, 2],
+  Mort_28d = 1 - surv_mat[, 1],
+  Mort_90d = 1 - surv_mat[, 2],
+  Median_Survival_Days = median_surv
+)
+risk_group_summary <- risk_group_summary[
+  match(c("Low", "Intermediate", "High"), risk_group_summary$Risk_Group),
+]
+
+write.csv(
+  risk_group_summary,
+  file.path(OUT_DIR_TXT, "09_TEST_risk_group_survival_rates.csv"),
+  row.names = FALSE, fileEncoding = "UTF-8"
+)
+
+# ============================================================
+# 29. DECISION CURVE ANALYSIS — FIX7 FINAL
+# ============================================================
+# Horizon-specific IPCW DCA (NOT ordinary binary DCA). For each horizon,
+#   Case     = death by horizon
+#   Control  = known alive beyond horizon
+#   Early censoring is handled by IPCW, not treated as survival.
+# Model probabilities are horizon-specific predicted MORTALITY risk:
+#   - Development: FULL-development (apparent) predictions (Cox-calibrated
+#     apparent risk for the risk-score models, native survival for RSF).
+#   - Test: locked-model predictions (test_calibrated_prob).
+# The threshold range is fixed in advance (0.05-0.80 by 0.01) and is NEVER
+# used to select a cutoff, tune a model, or choose a "best" model. DCA only
+# assesses clinical utility. The "Treat_All" reference uses the SAME /N
+# denominator as the model net benefit, so all curves are on one scale.
+# ============================================================
+
+dca_one_ipcw <- function(time, event, p, horizon, thresholds) {
+  time <- as.numeric(time); event <- as.integer(event); p <- as.numeric(p)
+  ck <- make_censor_km(time, event)
+  case <- event == 1L & time <= horizon
+  control <- (time > horizon) | (event == 0L & time == horizon)
+  w <- numeric(length(time)); y <- rep(NA_integer_, length(time))
+  if (any(case)) {
+    w[case] <- vapply(time[case], ck$G_left, numeric(1))
+    w[case] <- 1 / pmax(w[case], 1e-8)
+    y[case] <- 1L
+  }
+  if (any(control)) {
+    Gt <- ck$G_left(horizon)
+    w[control] <- 1 / max(Gt, 1e-8)
+    y[control] <- 0L
+  }
+  valid <- w > 0 & is.finite(w) & !is.na(y) & is.finite(p)
+  if (sum(valid) < 10L) {
+    return(tibble(Threshold = thresholds,
+                  Net_Benefit = NA_real_,
+                  N_IPCW = sum(valid)))
+  }
+  w <- w[valid]; y <- y[valid]; p <- p[valid]
+  N <- length(time)
+  map_dfr(thresholds, function(th) {
+    positive <- p >= th
+    tp_w <- sum(w * positive * (y == 1L))
+    fp_w <- sum(w * positive * (y == 0L))
+    nb <- (tp_w / N) - (fp_w / N) * th / (1 - th)
+    tibble(Threshold = th, Net_Benefit = nb, N_IPCW = sum(valid))
+  })
+}
+
+# IPCW case/control weight sums for a fixed horizon, used to put the
+# "Treat All" reference on the same /N scale as the model net benefit.
+calc_ipcw_case_control_weights <- function(time, event, horizon) {
+  time <- as.numeric(time); event <- as.integer(event)
+  ck <- make_censor_km(time, event)
+  case <- event == 1L & time <= horizon
+  control <- (time > horizon) | (event == 0L & time == horizon)
+  w <- numeric(length(time))
+  if (any(case)) {
+    w[case] <- 1 / pmax(vapply(time[case], ck$G_left, numeric(1)), 1e-8)
+  }
+  if (any(control)) {
+    w[control] <- 1 / max(ck$G_left(horizon), 1e-8)
+  }
+  list(C = sum(w[case]), K = sum(w[control]), N = length(time))
+}
+
+dca_thresholds <- seq(0.05, 0.80, by = 0.01)
+
+# ------------------------------------------------------------
+# Development DCA (apparent / in-sample)
+# ------------------------------------------------------------
+dev_dca_prob <- list()
+for (nm in names(test_calibrated_prob)) {
+  if (nm == "RSF") {
+    dev_dca_prob[[nm]] <- dev_rsf_mortality
+  } else {
+    if (!is.null(calibration_models[[nm]])) {
+      risk_dev <- dev_risk[[nm]]
+      dev_dca_prob[[nm]] <- predict_calibrated_mortality(
+        calibration_models[[nm]], risk_dev, PRED_TIMES
+      )
+    }
+  }
+}
+
+dev_dca_results <- list()
+for (nm in names(dev_dca_prob)) {
+  pmat <- dev_dca_prob[[nm]]
+  for (j in seq_along(PRED_TIMES)) {
+    tt <- PRED_TIMES[j]
+    d <- dca_one_ipcw(
+      development[[TIME_VAR]], development[[EVENT_VAR]], pmat[, j], tt,
+      dca_thresholds
+    )
+    d$Model <- nm
+    d$Time  <- tt
+    dev_dca_results[[length(dev_dca_results) + 1L]] <- d
+  }
+}
+dev_dca_df <- bind_rows(dev_dca_results)
+
+if (nrow(dev_dca_df) > 0) {
+  dev_dca_ref <- map_dfr(sort(unique(dev_dca_df$Time)), function(tt) {
+    cc <- calc_ipcw_case_control_weights(
+      development[[TIME_VAR]], development[[EVENT_VAR]], tt
+    )
+    odds <- dca_thresholds / (1 - dca_thresholds)
+    tibble(
+      Threshold = dca_thresholds,
+      Net_Benefit = (cc$C - cc$K * odds) / cc$N,
+      N_IPCW = NA_integer_,
+      Model = "Treat_All",
+      Time = tt
+    )
+  })
+  dev_dca_none <- tibble(
+    Threshold = rep(dca_thresholds, length(unique(dev_dca_df$Time))),
+    Net_Benefit = 0,
+    N_IPCW = NA_integer_,
+    Model = "Treat_None",
+    Time = rep(sort(unique(dev_dca_df$Time)), each = length(dca_thresholds))
+  )
+  dev_dca_df <- bind_rows(dev_dca_df, dev_dca_ref, dev_dca_none)
+}
+
+write.csv(
+  dev_dca_df,
+  file.path(OUT_DIR_TXT, "10_Development_DCA_28_90_IPCW.csv"),
+  row.names = FALSE, fileEncoding = "UTF-8"
+)
+
+# ------------------------------------------------------------
+# Test DCA (locked predictions)
+# ------------------------------------------------------------
+dca_results <- list()
+for (nm in names(test_calibrated_prob)) {
+  pmat <- test_calibrated_prob[[nm]]
+  for (j in seq_along(PRED_TIMES)) {
+    tt <- PRED_TIMES[j]
+    d <- dca_one_ipcw(
+      test_set[[TIME_VAR]], test_set[[EVENT_VAR]], pmat[, j], tt, dca_thresholds
+    )
+    d$Model <- nm
+    d$Time <- tt
+    dca_results[[length(dca_results) + 1L]] <- d
+  }
+}
+
+dca_df <- bind_rows(dca_results)
+
+# Treat All reference: same /N denominator as the model net benefit
+# (NB_treat_all = (C - K * odds) / N), so the reference line and the
+# model curves are on one scale under right-censoring.
+if (nrow(dca_df) > 0) {
+  dca_ref <- map_dfr(sort(unique(dca_df$Time)), function(tt) {
+    cc <- calc_ipcw_case_control_weights(
+      test_set[[TIME_VAR]], test_set[[EVENT_VAR]], tt
+    )
+    odds <- dca_thresholds / (1 - dca_thresholds)
+    tibble(
+      Threshold = dca_thresholds,
+      Net_Benefit = (cc$C - cc$K * odds) / cc$N,
+      N_IPCW = NA_integer_,
+      Model = "Treat_All",
+      Time = tt
+    )
+  })
+  dca_none <- tibble(
+    Threshold = rep(dca_thresholds, length(unique(dca_df$Time))),
+    Net_Benefit = 0,
+    N_IPCW = NA_integer_,
+    Model = "Treat_None",
+    Time = rep(sort(unique(dca_df$Time)), each = length(dca_thresholds))
+  )
+  dca_df <- bind_rows(dca_df, dca_ref, dca_none)
+}
+
+write.csv(dca_df,
+          file.path(OUT_DIR_TXT, "10_TEST_DCA_28_90_IPCW.csv"),
+          row.names = FALSE, fileEncoding = "UTF-8")
+
+# ------------------------------------------------------------
+# Combined DCA figure: 2x2 (28d + 90d x Development + Test), shared y-axis,
+# negative values compressed to 1/5 of the total y-axis height.
+# ------------------------------------------------------------
+if (nrow(dev_dca_df) > 0) dev_dca_df$Dataset <- "Development (apparent)"
+if (nrow(dca_df) > 0)     dca_df$Dataset     <- "Test"
+
+dca_plot_df <- bind_rows(dev_dca_df, dca_df)
+
+if (nrow(dca_plot_df) > 0) {
+  nb_finite <- dca_plot_df$Net_Benefit[is.finite(dca_plot_df$Net_Benefit)]
+  max_pos <- ceiling(max(nb_finite[nb_finite >= 0], na.rm = TRUE) / 0.05) * 0.05
+  min_neg <- floor(min(nb_finite[nb_finite < 0], na.rm = TRUE) / 0.5) * 0.5
+  if (!is.finite(min_neg)) min_neg <- -0.5
+  min_neg <- max(min_neg, -5)          # safety clamp: prevent negative-value explosion from aberrant IPCW weights
+  k <- max_pos / (4 * abs(min_neg))    # compress negatives to 1/5 of the total y-axis height
+
+  model_labels <- c(Cox = "Cox", ElasticNet_Cox = "ElasticNet", XGBoost = "XGBoost",
+                    RSF = "RSF",
+                    Treat_All = "Treat All", Treat_None = "Treat None")
+  dca_plot_df$Model <- factor(
+    model_labels[as.character(dca_plot_df$Model)],
+    levels = c("Cox", "ElasticNet", "XGBoost", "RSF", "Treat All", "Treat None")
+  )
+  model_colors <- c(Cox = "#4477AA", ElasticNet = "#EE6677", XGBoost = "#228833",
+                    RSF = "#CCBB44",
+                    `Treat All` = "grey60", `Treat None` = "black")
+  model_ltypes <- c(Cox = "solid", ElasticNet = "solid", XGBoost = "solid",
+                    RSF = "solid",
+                    `Treat All` = "dashed", `Treat None` = "dotted")
+  dca_plot_df$Time_lab <- factor(paste0(dca_plot_df$Time, "-day"),
+                                 levels = c("28-day", "90-day"))
+
+  # Manual broken axis: negatives are scaled by k to 1/5 while the positive half keeps its original scale (ordinary linear axis).
+  dca_plot_df$Net_Benefit_plot <- ifelse(
+    dca_plot_df$Net_Benefit >= 0, dca_plot_df$Net_Benefit, dca_plot_df$Net_Benefit * k
+  )
+  pos_breaks_orig <- seq(0, max_pos, by = 0.05)
+  neg_breaks_orig <- seq(0, min_neg, by = -1)[-1]
+  plot_breaks <- c(neg_breaks_orig * k, pos_breaks_orig)
+  break_labels <- c(as.character(neg_breaks_orig), sprintf("%.2f", pos_breaks_orig))
+
+  p_dca <- ggplot(
+    dca_plot_df,
+    aes(x = Threshold, y = Net_Benefit_plot, color = Model, linetype = Model)
+  ) +
+    geom_hline(yintercept = 0, color = "grey80") +
+    geom_line(linewidth = 0.7) +
+    facet_grid(Time_lab ~ Dataset, scales = "fixed") +
+    scale_x_continuous(breaks = seq(0, 0.8, by = 0.2), limits = c(0, 0.8)) +
+    scale_y_continuous(breaks = plot_breaks, labels = break_labels,
+                       limits = c(min_neg * k, max_pos)) +
+    scale_color_manual(values = model_colors) +
+    scale_linetype_manual(values = model_ltypes) +
+    theme_classic(base_size = 11) +
+    theme(legend.position = "bottom", legend.title = element_blank(),
+          legend.key.width = unit(1.2, "cm"),
+          strip.text = element_text(face = "bold"),
+          panel.spacing = unit(0.8, "lines")) +
+    labs(x = "Threshold probability", y = "Net benefit")
+
+  ggsave(file.path(OUT_DIR_FIG, "DCA_28_90_combined.png"), p_dca, width = 9, height = 7, dpi = 300)
+  ggsave(file.path(OUT_DIR_FIG, "DCA_28_90_combined.pdf"), p_dca, width = 9, height = 7)
+}
+
+# ============================================================
+# 29b. THRESHOLD-BASED CLASSIFICATION METRICS (28/90-day)
+# ============================================================
+# Confusion-matrix decision metrics at a single cutoff, complementing
+# the threshold-independent AUC/C-index and the DCA net-benefit curve.
+#
+# - Prediction score = calibrated 28/90-day mortality probability
+#   (Development apparent Cox calibration; TEST is not used for fitting).
+# - Cutoff = Youden index (max IPCW-weighted sensitivity+specificity)
+#   learned on DEVELOPMENT apparent calibrated probabilities.
+# - TEST metrics use an IPCW-weighted confusion matrix (early-censored
+#   patients excluded; survivors and deaths reweighted).
+# ============================================================
+
+message("")
+message("====================================================")
+message("THRESHOLD-BASED CLASSIFICATION METRICS")
+message("====================================================")
+
+youden_cutoff_ipcw <- function(time, event, p, horizon) {
+  time <- as.numeric(time); event <- as.integer(event); p <- as.numeric(p)
+  ck <- make_censor_km(time, event)
+  case <- event == 1L & time <= horizon
+  control <- (time > horizon) | (event == 0L & time == horizon)
+  w <- numeric(length(time)); y <- rep(NA_integer_, length(time))
+  if (any(case)) {
+    w[case] <- 1 / pmax(vapply(time[case], ck$G_left, numeric(1)), 1e-8)
+    y[case] <- 1L
+  }
+  if (any(control)) {
+    w[control] <- 1 / max(ck$G_left(horizon), 1e-8)
+    y[control] <- 0L
+  }
+  valid <- w > 0 & is.finite(w) & !is.na(y) & is.finite(p)
+  if (sum(valid) < 10L) return(list(cutoff = NA_real_, youden = NA_real_))
+  w <- w[valid]; y <- y[valid]; p <- p[valid]
+
+  cand <- sort(unique(p))
+  best_cut <- NA_real_; best_youden <- -Inf
+  for (th in cand) {
+    pos <- p >= th
+    TP <- sum(w[pos & y == 1L]); FN <- sum(w[!pos & y == 1L])
+    FP <- sum(w[pos & y == 0L]); TN <- sum(w[!pos & y == 0L])
+    if (TP + FN <= 0 || TN + FP <= 0) next
+    sens <- TP / (TP + FN); spec <- TN / (TN + FP)
+    youden <- sens + spec - 1
+    if (is.finite(youden) && youden > best_youden) {
+      best_youden <- youden
+      best_cut <- th
+    }
+  }
+  list(cutoff = best_cut, youden = best_youden)
+}
+
+classification_at_cutoff <- function(time, event, p, cutoff, horizon) {
+  time <- as.numeric(time); event <- as.integer(event); p <- as.numeric(p)
+  ck <- make_censor_km(time, event)
+  case <- event == 1L & time <= horizon
+  control <- (time > horizon) | (event == 0L & time == horizon)
+  w <- numeric(length(time)); y <- rep(NA_integer_, length(time))
+  if (any(case)) {
+    w[case] <- 1 / pmax(vapply(time[case], ck$G_left, numeric(1)), 1e-8)
+    y[case] <- 1L
+  }
+  if (any(control)) {
+    w[control] <- 1 / max(ck$G_left(horizon), 1e-8)
+    y[control] <- 0L
+  }
+  valid <- w > 0 & is.finite(w) & !is.na(y) & is.finite(p)
+  if (sum(valid) < 10L) return(NULL)
+  w <- w[valid]; y <- y[valid]; p <- p[valid]
+  pos <- p >= cutoff
+
+  TP_raw <- sum(pos & y == 1L); FP_raw <- sum(pos & y == 0L)
+  TN_raw <- sum(!pos & y == 0L); FN_raw <- sum(!pos & y == 1L)
+
+  TP <- sum(w[pos & y == 1L]); FP <- sum(w[pos & y == 0L])
+  TN <- sum(w[!pos & y == 0L]); FN <- sum(w[!pos & y == 1L])
+  n <- sum(w)
+
+  sens <- if (TP + FN > 0) TP / (TP + FN) else NA_real_
+  spec <- if (TN + FP > 0) TN / (TN + FP) else NA_real_
+  ppv  <- if (TP + FP > 0) TP / (TP + FP) else NA_real_
+  npv  <- if (TN + FN > 0) TN / (TN + FN) else NA_real_
+  f1   <- if (2 * TP + FP + FN > 0) 2 * TP / (2 * TP + FP + FN) else NA_real_
+  jaccard <- if (TP + FP + FN > 0) TP / (TP + FP + FN) else NA_real_
+  denom_mcc <- sqrt((TP + FP) * (TP + FN) * (TN + FP) * (TN + FN))
+  mcc <- if (denom_mcc > 0) (TP * TN - FP * FN) / denom_mcc else NA_real_
+  po <- (TP + TN) / n
+  pe <- ((TP + FP) * (TP + FN) + (TN + FP) * (TN + FN)) / (n * n)
+  kappa <- if (1 - pe > 0) (po - pe) / (1 - pe) else NA_real_
+  acc <- (TP + TN) / n
+
+  list(
+    N = sum(valid),
+    TP_raw = TP_raw, FP_raw = FP_raw, TN_raw = TN_raw, FN_raw = FN_raw,
+    TP = TP, FP = FP, TN = TN, FN = FN,
+    Sensitivity = sens, Specificity = spec,
+    PPV = ppv, NPV = npv,
+    F1 = f1, Jaccard = jaccard,
+    MCC = mcc, Kappa = kappa, Accuracy = acc
+  )
+}
+
+classif_summary <- list()
+classif_conf <- list()
+
+for (nm in names(test_calibrated_prob)) {
+  if (nm == "RSF") {
+    dev_prob <- dev_rsf_mortality
+  } else {
+    cal_fit <- calibration_models[[nm]]
+    if (is.null(cal_fit)) next
+    risk_dev <- dev_risk[[nm]]
+    dev_prob <- predict_calibrated_mortality(cal_fit, risk_dev, PRED_TIMES)
+  }
+
+  for (j in seq_along(PRED_TIMES)) {
+    tt <- PRED_TIMES[j]
+
+    cutoff <- youden_cutoff_ipcw(
+      development[[TIME_VAR]], development[[EVENT_VAR]],
+      dev_prob[, j], tt
+    )
+    if (is.na(cutoff$cutoff)) next
+
+    m <- classification_at_cutoff(
+      test_set[[TIME_VAR]], test_set[[EVENT_VAR]],
+      test_calibrated_prob[[nm]][, j], cutoff$cutoff, tt
+    )
+    if (is.null(m)) next
+
+    classif_summary[[length(classif_summary) + 1L]] <- tibble(
+      Model = nm,
+      Time = tt,
+      Cutoff = cutoff$cutoff,
+      Youden_Dev = cutoff$youden,
+      N_CompleteCases = m$N,
+      Sensitivity = m$Sensitivity,
+      Specificity = m$Specificity,
+      PPV = m$PPV,
+      NPV = m$NPV,
+      F1 = m$F1,
+      Jaccard = m$Jaccard,
+      MCC = m$MCC,
+      Kappa = m$Kappa,
+      Accuracy = m$Accuracy
+    )
+
+    classif_conf[[length(classif_conf) + 1L]] <- tibble(
+      Model = nm,
+      Time = tt,
+      TP_raw = m$TP_raw, FP_raw = m$FP_raw,
+      TN_raw = m$TN_raw, FN_raw = m$FN_raw,
+      TP_IPCW = m$TP, FP_IPCW = m$FP,
+      TN_IPCW = m$TN, FN_IPCW = m$FN
+    )
+  }
+}
+
+classif_df <- bind_rows(classif_summary)
+conf_df <- bind_rows(classif_conf)
+
+write.csv(
+  classif_df,
+  file.path(OUT_DIR_TXT, "10b_TEST_classification_metrics_28_90.csv"),
+  row.names = FALSE, fileEncoding = "UTF-8"
+)
+write.csv(
+  conf_df,
+  file.path(OUT_DIR_TXT, "10b_TEST_confusion_matrices_28_90.csv"),
+  row.names = FALSE, fileEncoding = "UTF-8"
+)
+
+if (nrow(classif_df) > 0) {
+  p_cls <- classif_df |>
+    select(Model, Time, Sensitivity, Specificity, PPV, NPV, F1) |>
+    tidyr::pivot_longer(
+      -c(Model, Time), names_to = "Metric", values_to = "Value"
+    ) |>
+    ggplot(aes(x = Model, y = Value, color = Metric, shape = Metric)) +
+    geom_point(size = 2.8) +
+    facet_wrap(~ Time, nrow = 1) +
+    coord_cartesian(ylim = c(0, 1)) +
+    theme_classic(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(
+      title = "TEST classification metrics at Youden cutoff — 28/90-day",
+      x = NULL, y = "Metric value"
+    )
+
+  ggsave(
+    file.path(OUT_DIR_FIG, "10b_TEST_classification_metrics_28_90.png"),
+    p_cls, width = 11, height = 6, dpi = 300
+  )
+  ggsave(
+    file.path(OUT_DIR_FIG, "10b_TEST_classification_metrics_28_90.pdf"),
+    p_cls, width = 11, height = 6
+  )
+}
+
+message("")
+message("THRESHOLD-BASED CLASSIFICATION METRICS COMPLETED")
+message("====================================================")
+
+# 30. COX HAZARD RATIOS — RUBIN'S RULES POOLING (M IMPUTATIONS)
+# ============================================================
+# The final Cox model is a LIST of M models (one per imputed dataset,
+# final_models$Cox). Coefficients are pooled across imputations with
+# Rubin's rules:
+#   pooled coefficient = mean of imputation-specific coefficients
+#   total variance     = within + (1 + 1/M) * between
+#   Barnard-Rubin degrees of freedom (df -> Inf if between-var ~ 0)
+# HR / 95% CI / P are reported from the pooled estimate. This is the MI
+# inference for the Cox model, distinct from the simple prediction
+# averaging used elsewhere for risk scores.
+
+pool_cox_rubin <- function(model_list) {
+  m <- length(model_list)
+  if (m < 1L) stop("pool_cox_rubin needs at least one Cox model.")
+
+  cn <- names(stats::coef(model_list[[1]]))
+
+  if (m == 1L) {
+    fit <- model_list[[1]]
+    co <- summary(fit)$coefficients
+    ci <- suppressWarnings(stats::confint(fit))
+    return(tibble(
+      Feature = rownames(co),
+      Coefficient = co[, "coef"],
+      SE = co[, "se(coef)"],
+      HR = exp(co[, "coef"]),
+      CI_Lower = exp(ci[, 1]),
+      CI_Upper = exp(ci[, 2]),
+      P_value = co[, "Pr(>|z|)"],
+      df = NA_real_
+    ))
+  }
+
+  Q <- vapply(
+    model_list,
+    function(fit) stats::coef(fit)[cn],
+    numeric(length(cn))
+  )
+  U <- vapply(
+    model_list,
+    function(fit) diag(stats::vcov(fit)[cn, cn, drop = FALSE]),
+    numeric(length(cn))
+  )
+
+  Qbar <- rowMeans(Q)
+  Ubar <- rowMeans(U)
+  B <- apply(Q, 1, function(q) sum((q - mean(q))^2) / (m - 1))
+  Tvar <- Ubar + (1 + 1 / m) * B
+
+  r <- (1 + 1 / m) * B / Ubar
+  df <- (m - 1) * (1 + 1 / r)^2
+  df[!is.finite(r) | r <= 0] <- Inf
+
+  se <- sqrt(Tvar)
+  tstat <- Qbar / se
+  tcrit <- stats::qt(0.975, df = df)
+  pval <- 2 * stats::pt(-abs(tstat), df = df)
+
+  tibble(
+    Feature = cn,
+    Coefficient = Qbar,
+    SE = se,
+    HR = exp(Qbar),
+    CI_Lower = exp(Qbar - tcrit * se),
+    CI_Upper = exp(Qbar + tcrit * se),
+    P_value = pval,
+    df = df
+  )
+}
+
+cox_table <- pool_cox_rubin(final_models$Cox)
+
+write.csv(
+  cox_table,
+  file.path(OUT_DIR_TXT, "11_Cox_HR_95CI_pooled_Rubin.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+# Representative (imputation-1) view, retained for transparency only;
+# the pooled table above is the reported MI inference.
+cox_rep_coef <- summary(rep_models$Cox)$coefficients
+cox_rep_ci <- suppressWarnings(stats::confint(rep_models$Cox))
+cox_rep_table <- tibble(
+  Feature = rownames(cox_rep_coef),
+  Coefficient = cox_rep_coef[, "coef"],
+  HR = exp(cox_rep_coef[, "coef"]),
+  CI_Lower = exp(cox_rep_ci[, 1]),
+  CI_Upper = exp(cox_rep_ci[, 2]),
+  P_value = cox_rep_coef[, "Pr(>|z|)"]
+)
+
+write.csv(
+  cox_rep_table,
+  file.path(OUT_DIR_TXT, "11_Cox_HR_95CI_representative_m1.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+# ============================================================
+# 30b. COX PH ASSUMPTION CHECK (cox.zph)
+# ============================================================
+# The proportional-hazards assumption is tested on the representative
+# (imputation-1) final Cox model via scaled Schoenfeld residuals. The
+# GLOBAL test (last row) and per-covariate rho / chi-square / P are
+# saved; scaled Schoenfeld residuals are exported for diagnostics.
+# ============================================================
+
+zph_test <- tryCatch(
+  survival::cox.zph(rep_models$Cox),
+  error = function(e) {
+    warning("cox.zph failed: ", conditionMessage(e))
+    NULL
+  }
+)
+
+if (!is.null(zph_test)) {
+
+  zph_table <- as.data.frame(zph_test$table)
+  zph_table <- tibble::rownames_to_column(zph_table, "Term")
+
+  write.csv(
+    zph_table,
+    file.path(OUT_DIR_TXT, "11b_Cox_PH_assumption_coxzph.csv"),
+    row.names = FALSE,
+    fileEncoding = "UTF-8"
+  )
+
+  # Scaled Schoenfeld residuals (one column per covariate, over event
+  # times). zph_test$x = event times, zph_test$y = residual matrix.
+  resid_df <- data.frame(Time = zph_test$x)
+  resid_df <- cbind(resid_df, as.data.frame(zph_test$y))
+
+  write.csv(
+    resid_df,
+    file.path(OUT_DIR_TXT, "11b_Cox_Schoenfeld_residuals.csv"),
+    row.names = FALSE,
+    fileEncoding = "UTF-8"
+  )
+
+  tryCatch(
+    {
+      pdf(
+        file.path(OUT_DIR_FIG, "11b_Cox_Schoenfeld_diagnostic.pdf"),
+        width = 10, height = 7
+      )
+      print(survminer::ggcoxzph(zph_test))
+      dev.off()
+    },
+    error = function(e) warning("ggcoxzph plot failed: ", conditionMessage(e))
+  )
+}
+
+# ============================================================
+# 31. VARIABLE IMPORTANCE
+# ============================================================
+
+# RSF permutation importance
+rsf_imp <- tryCatch(
+  rep_models$RSF$variable.importance,
+  error = function(e) NULL
+)
+
+if (!is.null(rsf_imp)) {
+
+  rsf_imp_df <- tibble(
+    Feature = names(rsf_imp),
+    Importance = as.numeric(rsf_imp)
+  ) |>
+    arrange(desc(Importance))
+
+  write.csv(
+    rsf_imp_df,
+    file.path(
+      OUT_DIR_TXT,
+      "12_RSF_permutation_importance.csv"
+    ),
+    row.names = FALSE
+  )
+}
+
+# ============================================================
+# 32. SAVE FINAL MODELS AND SPECIFICATION
+# ============================================================
+
+for (nm in names(final_models)) {
+
+  if (!is.null(final_models[[nm]])) {
+
+    saveRDS(
+      final_models[[nm]],
+      file.path(
+        OUT_DIR_RDS,
+        paste0(
+          "FINAL_",
+          nm,
+          "_model.rds"
+        )
+      )
+    )
+  }
+}
+
+analysis_spec <- list(
+  design = "Development train / external validation (no internal test split)",
+  dev_file = DEV_FILE,
+  test_file = TEST_FILE,
+  seed_cv = SEED_CV,
+  seed_model = SEED_MODEL,
+  n_all = nrow(dat),
+  n_development = nrow(development),
+  n_test = nrow(test_set),
+  n_events_all = sum(dat[[EVENT_VAR]] == 1),
+  n_events_development = sum(
+    development[[EVENT_VAR]] == 1
+  ),
+  n_events_test = sum(
+    test_set[[EVENT_VAR]] == 1
+  ),
+  time_var = TIME_VAR,
+  event_var = EVENT_VAR,
+  prediction_times = PRED_TIMES,
+  predictor_vars = predictor_vars,
+  categorical_vars = factor_vars,
+  base_models = model_names,
+  rsf_best = rsf_best,
+  xgb_best = xgb_best
+)
+
+saveRDS(
+  analysis_spec,
+  file.path(
+    OUT_DIR_RDS,
+    "13_analysis_specification.rds"
+  )
+)
+
+
+# ============================================================
+# FIX7 FINAL SAFETY CHECKS
+# ============================================================
+if (!identical(as.integer(PRED_TIMES), c(28L, 90L))) {
+  stop("FIX7 FINAL requires PRED_TIMES = c(28, 90).")
+}
+if (any(!is.finite(test_metrics$AUC_28d)) || any(!is.finite(test_metrics$AUC_90d))) {
+  warning("One or more TEST AUC values are NA/non-finite. Inspect endpoint/censoring diagnostics.")
+}
+
+# ============================================================
+# 33. EXCEL SUMMARY
+# ============================================================
+
+wb <- openxlsx::createWorkbook()
+
+excel_tables <- list(
+  TRAIN_VALID_Performance = perf_summary,
+  Split_Summary = split_summary,
+  Predictors = predictor_dictionary,
+  RSF_Tuning = rsf_tuning,
+  XGB_Tuning = xgb_tuning,
+  TEST_Performance = test_metrics,
+  TEST_Calibration = calibration_df,
+  TEST_Brier = brier_df,
+  TEST_Brier_Summary = brier_summary_df,
+  TEST_DCA = dca_df,
+  TEST_Risk_Groups = risk_group_table,
+  TEST_KM = km_result,
+  Cox_HR = cox_table,
+  TEST_Bootstrap_CI = test_bootstrap_ci,
+  DEV_Bootstrap_CI = dev_bootstrap_ci
+)
+
+if (exists("rsf_imp_df")) {
+  excel_tables$RSF_Importance <- rsf_imp_df
+}
+
+if (exists("zph_table")) {
+  excel_tables$Cox_PH_Assumption <- zph_table
+}
+
+for (nm in names(excel_tables)) {
+
+  openxlsx::addWorksheet(
+    wb,
+    nm
+  )
+
+  openxlsx::writeData(
+    wb,
+    sheet = nm,
+    x = excel_tables[[nm]]
+  )
+}
+
+openxlsx::saveWorkbook(
+  wb,
+  file.path(
+    OUT_DIR_TXT,
+    "ACLF_Survival_ML_FIX7_FINAL_28_90_results.xlsx"
+  ),
+  overwrite = TRUE
+)
+
+# ============================================================
+# 34. SESSION INFO
+# ============================================================
+
+capture.output(
+  sessionInfo(),
+  file = file.path(
+    OUT_DIR_TXT,
+    "14_sessionInfo.txt"
+  )
+)
+
+# ============================================================
+# 35. FINAL SUMMARY
+# ============================================================
+
+message("")
+message("====================================================")
+message("ACLF SURVIVAL ML FIX7 FINAL 28/90 FINISHED")
+message("====================================================")
+message("")
+message("ALL              : ", nrow(dat))
+message("DEVELOPMENT (development cohort) : ", nrow(development))
+message("TEST (external validation)      : ", nrow(test_set))
+message("")
+message("Development events: ",
+        sum(development[[EVENT_VAR]] == 1))
+message("Test events       : ",
+        sum(test_set[[EVENT_VAR]] == 1))
+message("")
+message("Train (development) vs Validation (external validation) performance:")
+print(perf_summary)
+message("")
+message("Main output:")
+message("  06b_TRAIN_VALID_performance_summary.csv")
+message("  06_TEST_FINAL_discrimination_28_90.csv")
+message("  06_TEST_predictions_28_90.csv")
+message("  07_TEST_calibration_summary_28_90.csv")
+message("  08_TEST_Brier_scores_28_90.csv")
+message("  08_TEST_Brier_summary_28_90.csv")
+message("  09_TEST_locked_risk_groups.csv")
+message("  09_TEST_Kaplan_Meier_risk_groups.pdf")
+message("  10_Development_DCA_28_90_IPCW.csv")
+message("  10_TEST_DCA_28_90_IPCW.csv")
+message("  10_DCA_28day_IPCW.png / 10_DCA_90day_IPCW.png")
+message("  ACLF_Survival_ML_FIX7_FINAL_28_90_results.xlsx")
+message("")
+message("====================================================")
+message("IMPORTANT")
+message("====================================================")
+message("Do not change the survival endpoint to binary classification yourself.")
+message("====================================================")
