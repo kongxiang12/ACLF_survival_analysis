@@ -1354,9 +1354,9 @@ predict_calibrated_mortality <- function(
 # rate (used for calibration plots and the bootstrap "CalDiff" mean-calibration
 # metric); it is NOT the intercept-based calibration intercept — that is
 # computed separately by calc_ipcw_calibration_intercept().
-calc_ipcw_observed_risk <- function(time, event, horizon) {
+calc_ipcw_observed_risk <- function(time, event, horizon, ck = NULL) {
   time <- as.numeric(time); event <- as.integer(event)
-  ck <- make_censor_km(time, event)
+  if (is.null(ck)) ck <- make_censor_km(time, event)
   case <- event == 1L & time <= horizon
   control <- (time > horizon) | (event == 0L & time == horizon)
   w <- numeric(length(time)); y <- rep(NA_real_, length(time))
@@ -1396,7 +1396,7 @@ calc_ipcw_observed_risk <- function(time, event, horizon) {
 # predictions (too extreme), slope > 1 under-fitting. The 28-day and 90-day
 # slopes are computed with distinct horizons and are therefore genuinely
 # horizon-specific.
-calc_calibration_slope <- function(time, event, p, horizon) {
+calc_calibration_slope <- function(time, event, p, horizon, ck = NULL) {
   time  <- as.numeric(time)
   event <- as.integer(event)
   p     <- as.numeric(p)
@@ -1408,7 +1408,7 @@ calc_calibration_slope <- function(time, event, p, horizon) {
   e  <- event[ok]
   pp <- p[ok]
 
-  ck <- make_censor_km(t, e)
+  if (is.null(ck)) ck <- make_censor_km(t, e)
 
   case    <- e == 1L & t <= horizon
   control <- (t > horizon) | (e == 0L & t == horizon)
@@ -1464,7 +1464,7 @@ calc_calibration_slope <- function(time, event, p, horizon) {
 # positive = under-prediction (observed risk higher than predicted),
 # negative = over-prediction. 28-day and 90-day intercepts are computed with
 # distinct horizons.
-calc_ipcw_calibration_intercept <- function(time, event, p, horizon) {
+calc_ipcw_calibration_intercept <- function(time, event, p, horizon, ck = NULL) {
   time  <- as.numeric(time)
   event <- as.integer(event)
   p     <- as.numeric(p)
@@ -1476,7 +1476,7 @@ calc_ipcw_calibration_intercept <- function(time, event, p, horizon) {
   e  <- event[ok]
   pp <- p[ok]
 
-  ck <- make_censor_km(t, e)
+  if (is.null(ck)) ck <- make_censor_km(t, e)
 
   case    <- e == 1L & t <= horizon
   control <- (t > horizon) | (e == 0L & t == horizon)
@@ -1517,6 +1517,77 @@ calc_ipcw_calibration_intercept <- function(time, event, p, horizon) {
   if (is.null(fit)) return(NA_real_)
 
   as.numeric(stats::coef(fit)[1])
+}
+
+# Integrated Calibration Index (ICI) + E50/E90 (Austin & Steyerberg 2019),
+# horizon-specific and IPCW-weighted, using the same natural-spline smooth
+# calibration curve as calc_smooth_calibration(). For each patient, the
+# smoothed (spline) observed risk at their OWN predicted risk is compared to
+# the diagonal; the absolute error |predicted - smoothed(predicted)| is
+# summarized by its mean (ICI), median (E50) and 90th percentile (E90).
+# Lower values indicate better calibration. IPCW weights are identical to the
+# calibration slope / intercept: cases 1/G(time-), controls 1/G(horizon),
+# censored-before-horizon weight 0 (outcome unknown, NOT coded as 0).
+calc_ici_e50_e90 <- function(time, event, p, horizon, df = 3, ck = NULL) {
+  time  <- as.numeric(time)
+  event <- as.integer(event)
+  p     <- as.numeric(p)
+
+  ok <- is.finite(time) & !is.na(event) & is.finite(p) & p > 0 & p < 1
+  if (sum(ok) < 30) return(c(ICI = NA_real_, E50 = NA_real_, E90 = NA_real_))
+
+  t  <- time[ok]
+  e  <- event[ok]
+  pp <- p[ok]
+
+  if (is.null(ck)) ck <- make_censor_km(t, e)
+
+  case    <- e == 1L & t <= horizon
+  control <- (t > horizon) | (e == 0L & t == horizon)
+
+  w <- numeric(length(t))
+  y <- rep(NA_integer_, length(t))
+
+  if (any(case)) {
+    w[case] <- vapply(t[case], ck$G_left, numeric(1))
+    w[case] <- 1 / pmax(w[case], 1e-8)
+    y[case] <- 1L
+  }
+  if (any(control)) {
+    Gt <- ck$G_left(horizon)
+    w[control] <- 1 / max(Gt, 1e-8)
+    y[control] <- 0L
+  }
+
+  valid <- w > 0 & is.finite(w) & !is.na(y)
+  if (sum(valid) < 30) return(c(ICI = NA_real_, E50 = NA_real_, E90 = NA_real_))
+
+  if (sum(y[valid] == 1L) < 1L || sum(y[valid] == 0L) < 1L) {
+    return(c(ICI = NA_real_, E50 = NA_real_, E90 = NA_real_))
+  }
+
+  lp <- log(pp[valid] / (1 - pp[valid]))
+
+  fit <- tryCatch(
+    stats::glm(
+      y[valid] ~ splines::ns(lp, df = df),
+      family = stats::binomial(link = "logit"),
+      weights = w[valid]
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(fit)) return(c(ICI = NA_real_, E50 = NA_real_, E90 = NA_real_))
+
+  smoothed <- stats::predict(
+    fit, newdata = data.frame(lp = lp), type = "response"
+  )
+  abs_err <- abs(pp[valid] - as.numeric(smoothed))
+
+  c(
+    ICI = mean(abs_err, na.rm = TRUE),
+    E50 = as.numeric(stats::median(abs_err, na.rm = TRUE)),
+    E90 = as.numeric(stats::quantile(abs_err, 0.90, na.rm = TRUE))
+  )
 }
 
 # 10. MODEL FUNCTIONS
@@ -2911,6 +2982,18 @@ for (nm in names(test_risk)) {
 # RSF native horizon-specific mortality (28-day and 90-day distinct).
 test_calibrated_prob$RSF <- test_rsf_mortality
 
+# Development-side calibrated horizon-specific mortality (apparent / in-sample),
+# mirroring test_calibrated_prob, for the DEV calibration metrics (slope, ICI,
+# E50, E90) reported alongside the external-validation metrics. NOTE: these are
+# APPARENT (optimistically biased) — the models were fit on this cohort.
+dev_calibrated_prob <- list()
+dev_calibrated_prob$RSF <- dev_rsf_mortality
+for (nm in names(calibration_models)) {
+  dev_calibrated_prob[[nm]] <- predict_calibrated_mortality(
+    calibration_models[[nm]], dev_risk[[nm]], PRED_TIMES
+  )
+}
+
 saveRDS(
   calibration_models,
   file.path(
@@ -2938,11 +3021,17 @@ saveRDS(
 # models, and from native RSF survival (see section 23).
 # ============================================================
 
+# MELD / MELD-Na are established comparator scores with an intrinsic
+# probability interpretation and are NOT passed through recalibration, so they
+# are excluded from every calibration output (figure, tertile table, and the
+# CalDiff / CITL / CalSlope / ICI / E50 / E90 metrics).
+cal_models <- setdiff(names(test_calibrated_prob), c("MELD", "MELD-Na"))
+
 calibration_summary <- list()
 
 # For each model/time, derive tertiles from DEVELOPMENT apparent calibrated
 # probabilities, not from TEST.
-for (nm in names(test_calibrated_prob)) {
+for (nm in cal_models) {
   if (nm == "RSF") {
     dev_prob <- dev_rsf_mortality
   } else {
@@ -3038,7 +3127,7 @@ calc_smooth_calibration <- function(time, event, p, horizon, df = 3, n_grid = 10
 
 cal_smooth_list <- list()
 cal_spine_list  <- list()
-for (nm in names(test_calibrated_prob)) {
+for (nm in cal_models) {
   for (j in seq_along(PRED_TIMES)) {
     tt <- PRED_TIMES[j]
     pvec <- test_calibrated_prob[[nm]][, j]
@@ -3164,7 +3253,7 @@ write.csv(brier_summary_df,
 # independent performance estimates.
 # ============================================================
 
-BOOTSTRAP_B <- 2000
+BOOTSTRAP_B <- 1000
 
 bootstrap_test_ci <- function(B = BOOTSTRAP_B, seed = SEED_MODEL) {
   n <- nrow(test_set)
@@ -3186,10 +3275,18 @@ bootstrap_test_ci <- function(B = BOOTSTRAP_B, seed = SEED_MODEL) {
       paste0(nm, c("_C_index", "_AUC_28d", "_AUC_90d")))),
     unlist(lapply(names(surv_mats), function(nm)
       paste0(nm, c("_Brier_28d", "_Brier_90d")))),
-    unlist(lapply(names(test_calibrated_prob), function(nm)
+    unlist(lapply(cal_models, function(nm)
       paste0(nm, "_CalDiff_", PRED_TIMES, "d"))),
-    unlist(lapply(names(test_calibrated_prob), function(nm)
-      paste0(nm, "_CITL_", PRED_TIMES, "d")))
+    unlist(lapply(cal_models, function(nm)
+      paste0(nm, "_CITL_", PRED_TIMES, "d"))),
+    unlist(lapply(cal_models, function(nm)
+      paste0(nm, "_CalSlope_", PRED_TIMES, "d"))),
+    unlist(lapply(cal_models, function(nm)
+      paste0(nm, "_ICI_", PRED_TIMES, "d"))),
+    unlist(lapply(cal_models, function(nm)
+      paste0(nm, "_E50_", PRED_TIMES, "d"))),
+    unlist(lapply(cal_models, function(nm)
+      paste0(nm, "_E90_", PRED_TIMES, "d")))
   )
 
   boot_mat <- matrix(
@@ -3201,6 +3298,7 @@ bootstrap_test_ci <- function(B = BOOTSTRAP_B, seed = SEED_MODEL) {
   for (b in seq_len(B)) {
     idx <- sample.int(n, replace = TRUE)
     tb <- time[idx]; eb <- event[idx]
+    ck_b <- make_censor_km(tb, eb)
 
     for (nm in disc_models) {
       r <- test_risk[[nm]][idx]
@@ -3227,11 +3325,11 @@ bootstrap_test_ci <- function(B = BOOTSTRAP_B, seed = SEED_MODEL) {
       boot_mat[b, paste0(nm, "_Brier_90d")] <- bs$Brier[match(90, bs$Time)]
     }
 
-    for (nm in names(test_calibrated_prob)) {
+    for (nm in cal_models) {
       p <- test_calibrated_prob[[nm]][idx, , drop = FALSE]
       for (j in seq_along(PRED_TIMES)) {
         tt <- PRED_TIMES[j]
-        obs <- calc_ipcw_observed_risk(tb, eb, tt)
+        obs <- calc_ipcw_observed_risk(tb, eb, tt, ck = ck_b)
         # CalDiff = observed-minus-predicted mean-calibration difference
         # (kept as a complementary metric, NOT a calibration intercept).
         boot_mat[b, paste0(nm, "_CalDiff_", tt, "d")] <-
@@ -3239,7 +3337,15 @@ bootstrap_test_ci <- function(B = BOOTSTRAP_B, seed = SEED_MODEL) {
         # Strict IPCW calibration intercept (CITL): glm(y ~ offset(logit p),
         # weights = IPCW), slope fixed at 1. Refit on this bootstrap sample.
         boot_mat[b, paste0(nm, "_CITL_", tt, "d")] <-
-          calc_ipcw_calibration_intercept(tb, eb, p[, j], tt)
+          calc_ipcw_calibration_intercept(tb, eb, p[, j], tt, ck = ck_b)
+        # Calibration slope (coefficient of logit p in an IPCW-weighted
+        # logistic regression, slope free) and ICI / E50 / E90.
+        boot_mat[b, paste0(nm, "_CalSlope_", tt, "d")] <-
+          calc_calibration_slope(tb, eb, p[, j], tt, ck = ck_b)
+        ici <- calc_ici_e50_e90(tb, eb, p[, j], tt, ck = ck_b)
+        boot_mat[b, paste0(nm, "_ICI_", tt, "d")] <- ici[["ICI"]]
+        boot_mat[b, paste0(nm, "_E50_", tt, "d")] <- ici[["E50"]]
+        boot_mat[b, paste0(nm, "_E90_", tt, "d")] <- ici[["E90"]]
       }
     }
   }
@@ -3267,7 +3373,7 @@ bootstrap_test_ci <- function(B = BOOTSTRAP_B, seed = SEED_MODEL) {
     point[paste0(nm, "_Brier_28d")] <- bs$Brier[match(28, bs$Time)]
     point[paste0(nm, "_Brier_90d")] <- bs$Brier[match(90, bs$Time)]
   }
-  for (nm in names(test_calibrated_prob)) {
+  for (nm in cal_models) {
     p <- test_calibrated_prob[[nm]]
     for (j in seq_along(PRED_TIMES)) {
       tt <- PRED_TIMES[j]
@@ -3275,6 +3381,12 @@ bootstrap_test_ci <- function(B = BOOTSTRAP_B, seed = SEED_MODEL) {
         calc_ipcw_observed_risk(time, event, tt) - mean(p[, j], na.rm = TRUE)
       point[paste0(nm, "_CITL_", tt, "d")] <-
         calc_ipcw_calibration_intercept(time, event, p[, j], tt)
+      point[paste0(nm, "_CalSlope_", tt, "d")] <-
+        calc_calibration_slope(time, event, p[, j], tt)
+      ici <- calc_ici_e50_e90(time, event, p[, j], tt)
+      point[paste0(nm, "_ICI_", tt, "d")] <- ici[["ICI"]]
+      point[paste0(nm, "_E50_", tt, "d")] <- ici[["E50"]]
+      point[paste0(nm, "_E90_", tt, "d")] <- ici[["E90"]]
     }
   }
 
@@ -3325,8 +3437,22 @@ bootstrap_dev_ci <- function(B = BOOTSTRAP_B, seed = SEED_MODEL) {
 
   disc_models <- names(dev_risk)
 
-  metric_names <- unlist(lapply(disc_models, function(nm)
-    paste0(nm, c("_C_index", "_AUC_28d", "_AUC_90d"))))
+  metric_names <- c(
+    unlist(lapply(disc_models, function(nm)
+      paste0(nm, c("_C_index", "_AUC_28d", "_AUC_90d")))),
+    unlist(lapply(cal_models, function(nm)
+      paste0(nm, "_CalDiff_", PRED_TIMES, "d"))),
+    unlist(lapply(cal_models, function(nm)
+      paste0(nm, "_CITL_", PRED_TIMES, "d"))),
+    unlist(lapply(cal_models, function(nm)
+      paste0(nm, "_CalSlope_", PRED_TIMES, "d"))),
+    unlist(lapply(cal_models, function(nm)
+      paste0(nm, "_ICI_", PRED_TIMES, "d"))),
+    unlist(lapply(cal_models, function(nm)
+      paste0(nm, "_E50_", PRED_TIMES, "d"))),
+    unlist(lapply(cal_models, function(nm)
+      paste0(nm, "_E90_", PRED_TIMES, "d")))
+  )
 
   boot_mat <- matrix(
     NA_real_, nrow = B, ncol = length(metric_names),
@@ -3337,6 +3463,7 @@ bootstrap_dev_ci <- function(B = BOOTSTRAP_B, seed = SEED_MODEL) {
   for (b in seq_len(B)) {
     idx <- sample.int(n, replace = TRUE)
     tb <- time[idx]; eb <- event[idx]
+    ck_b <- make_censor_km(tb, eb)
 
     for (nm in disc_models) {
       r <- dev_risk[[nm]][idx]
@@ -3352,6 +3479,24 @@ bootstrap_dev_ci <- function(B = BOOTSTRAP_B, seed = SEED_MODEL) {
         auc <- calc_td_auc(tb, eb, r, PRED_TIMES)
         boot_mat[b, paste0(nm, "_AUC_28d")] <- auc$AUC[match(28, auc$Time)]
         boot_mat[b, paste0(nm, "_AUC_90d")] <- auc$AUC[match(90, auc$Time)]
+      }
+    }
+
+    for (nm in cal_models) {
+      p <- dev_calibrated_prob[[nm]][idx, , drop = FALSE]
+      for (j in seq_along(PRED_TIMES)) {
+        tt <- PRED_TIMES[j]
+        obs <- calc_ipcw_observed_risk(tb, eb, tt, ck = ck_b)
+        boot_mat[b, paste0(nm, "_CalDiff_", tt, "d")] <-
+          obs - mean(p[, j], na.rm = TRUE)
+        boot_mat[b, paste0(nm, "_CITL_", tt, "d")] <-
+          calc_ipcw_calibration_intercept(tb, eb, p[, j], tt, ck = ck_b)
+        boot_mat[b, paste0(nm, "_CalSlope_", tt, "d")] <-
+          calc_calibration_slope(tb, eb, p[, j], tt, ck = ck_b)
+        ici <- calc_ici_e50_e90(tb, eb, p[, j], tt, ck = ck_b)
+        boot_mat[b, paste0(nm, "_ICI_", tt, "d")] <- ici[["ICI"]]
+        boot_mat[b, paste0(nm, "_E50_", tt, "d")] <- ici[["E50"]]
+        boot_mat[b, paste0(nm, "_E90_", tt, "d")] <- ici[["E90"]]
       }
     }
   }
@@ -3371,6 +3516,22 @@ bootstrap_dev_ci <- function(B = BOOTSTRAP_B, seed = SEED_MODEL) {
       auc <- calc_td_auc(time, event, r, PRED_TIMES)
       point[paste0(nm, "_AUC_28d")] <- auc$AUC[match(28, auc$Time)]
       point[paste0(nm, "_AUC_90d")] <- auc$AUC[match(90, auc$Time)]
+    }
+  }
+  for (nm in cal_models) {
+    p <- dev_calibrated_prob[[nm]]
+    for (j in seq_along(PRED_TIMES)) {
+      tt <- PRED_TIMES[j]
+      point[paste0(nm, "_CalDiff_", tt, "d")] <-
+        calc_ipcw_observed_risk(time, event, tt) - mean(p[, j], na.rm = TRUE)
+      point[paste0(nm, "_CITL_", tt, "d")] <-
+        calc_ipcw_calibration_intercept(time, event, p[, j], tt)
+      point[paste0(nm, "_CalSlope_", tt, "d")] <-
+        calc_calibration_slope(time, event, p[, j], tt)
+      ici <- calc_ici_e50_e90(time, event, p[, j], tt)
+      point[paste0(nm, "_ICI_", tt, "d")] <- ici[["ICI"]]
+      point[paste0(nm, "_E50_", tt, "d")] <- ici[["E50"]]
+      point[paste0(nm, "_E90_", tt, "d")] <- ici[["E90"]]
     }
   }
 
