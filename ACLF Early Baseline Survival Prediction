@@ -2578,7 +2578,7 @@ test_rsf_mortality <- 1 - test_rsf_surv
 colnames(test_rsf_mortality) <- paste0("Mortality_", PRED_TIMES, "d")
 
 # ------------------------------------------------------------
-# MELD / MELD-Na (UNOS) - conventional ACLF prognostic-score baselines
+# MELD / MELD-Na (specified Sodium-MELD implementation) - conventional ACLF prognostic-score baselines
 # ------------------------------------------------------------
 # Bilirubin/creatinine are already in conventional units (mg/dL); sodium in mmol/L; INR unitless.
 # MELD/MELD-Na are single time-independent scores; once added to test_risk / dev_risk,
@@ -2587,6 +2587,10 @@ calc_meld <- function(bili, inr, cr) {
   bili <- pmax(bili, 1); inr <- pmax(inr, 1); cr <- pmin(pmax(cr, 1), 4)
   3.78 * log(bili) + 11.2 * log(inr) + 9.57 * log(cr) + 6.43
 }
+# Sodium-MELD implementation: Trillium Gift of Life Network, TP-9-100,
+# Appendix 5A (SMC and PELD Calculations), p.39: Kim-form equation with
+# sodium bounded at 125-137 mmol/L. This is not the OPTN 1.32/0.033 equation.
+# https://www.giftoflife.on.ca/resources/pdf/healthcare/TP-9-100.pdf
 calc_meld_na <- function(meld, na) {
   na <- pmin(pmax(na, 125), 137)
   meld - na - 0.025 * meld * (140 - na) + 140
@@ -2953,7 +2957,8 @@ for (nm in names(test_risk)) {
   # predictions remain distinct native quantities.
   # MELD / MELD-Na are raw prognostic scores but are passed through the
   # same Cox calibration as the other risk-score models (Cox/ENet/XGBoost),
-  # so they enter the Brier / DCA / classification pipeline on equal footing.
+  # so exploratory Brier / classification outputs can be calculated.
+  # DCA is restricted to the four developed models in section 29.
   if (nm == "RSF") next
 
   risk_dev <- dev_risk[[nm]]
@@ -3021,10 +3026,11 @@ saveRDS(
 # models, and from native RSF survival (see section 23).
 # ============================================================
 
-# MELD / MELD-Na are established comparator scores with an intrinsic
-# probability interpretation and are NOT passed through recalibration, so they
-# are excluded from every calibration output (figure, tertile table, and the
-# CalDiff / CITL / CalSlope / ICI / E50 / E90 metrics).
+# Calibration reporting focuses on the four developed survival models.
+# MELD/MELD-Na are raw scores, not native 28/90-day mortality probabilities.
+# Section 24 fits development-only score-to-probability mappings for their
+# exploratory Brier/classification outputs; they are excluded from the
+# calibration reporting below and from DCA in section 29.
 cal_models <- setdiff(names(test_calibrated_prob), c("MELD", "MELD-Na"))
 
 calibration_summary <- list()
@@ -3044,14 +3050,19 @@ for (nm in cal_models) {
 
   for (j in seq_along(PRED_TIMES)) {
     tt <- PRED_TIMES[j]
-    q <- stats::quantile(dev_prob[, j], probs = c(0, 1/3, 2/3, 1), na.rm = TRUE, names = FALSE)
-    q <- unique(q)
-    if (length(q) < 4L) next
-
+    # Only the two INTERNAL cutpoints are learned from development.
+    # Infinite outer bounds retain external risks outside the development range.
+    inner_q <- stats::quantile(dev_prob[, j], probs = c(1/3, 2/3),
+                               na.rm = TRUE, names = FALSE)
+    if (any(!is.finite(inner_q))) stop("Non-finite development calibration cutpoints.")
+    q <- unique(c(-Inf, inner_q, Inf))
+    if (length(q) < 4L) warning("Tied tertile cutpoints: reporting fewer distinct risk groups.")
+    if (any(!is.finite(test_prob[, j]))) stop("Non-finite external calibration predictions.")
     grp <- cut(test_prob[, j], breaks = q, include.lowest = TRUE, labels = FALSE)
+    if (anyNA(grp)) stop("External patients were omitted from calibration groups.")
     for (g in seq_len(length(q) - 1L)) {
       ii <- which(grp == g)
-      if (length(ii) < 5L) next
+      if (length(ii) == 0L) next
       observed <- calc_ipcw_observed_risk(
         test_set[[TIME_VAR]][ii], test_set[[EVENT_VAR]][ii], tt
       )
@@ -3069,6 +3080,12 @@ for (nm in cal_models) {
 }
 
 calibration_df <- bind_rows(calibration_summary)
+calibration_group_counts <- calibration_df |>
+  group_by(Model, Time) |>
+  summarise(N_Grouped = sum(N), .groups = "drop")
+if (any(calibration_group_counts$N_Grouped != nrow(test_set))) {
+  stop("Calibration group counts do not cover the full external cohort.")
+}
 write.csv(calibration_df,
           file.path(OUT_DIR_TXT, "07_TEST_calibration_summary_28_90.csv"),
           row.names = FALSE, fileEncoding = "UTF-8")
@@ -3081,8 +3098,8 @@ write.csv(calibration_df,
 # (equivalent to riskRegression::calPlot / pec::calPlot). The spline is a
 # DESCRIPTIVE tool applied to the locked TEST predictions — no prognostic model
 # is refitted — and censoring is handled by the same marginal IPCW weights used
-# throughout (§8/§9). A predicted-risk histogram (spine) at the panel bottom
-# shows where the curve is supported by data.
+# throughout (§8/§9). An event-support rug at the panel bottom shows the
+# predicted risks of patients who died within the corresponding horizon.
 calc_smooth_calibration <- function(time, event, p, horizon, df = 3, n_grid = 100) {
   time <- as.numeric(time); event <- as.integer(event); p <- as.numeric(p)
   ok <- is.finite(time) & !is.na(event) & is.finite(p) & p > 0 & p < 1
@@ -3118,15 +3135,22 @@ calc_smooth_calibration <- function(time, event, p, horizon, df = 3, n_grid = 10
   if (is.null(fit)) return(NULL)
 
   grid_lp <- seq(min(lp), max(lp), length.out = n_grid)
-  obs <- stats::predict(fit, newdata = data.frame(lp = grid_lp), type = "response")
+  grid_df <- data.frame(lp = grid_lp)
+  # Approximate pointwise 95% band from the spline fit's link-scale standard
+  # error; uncertainty in the IPCW weights is not additionally accounted for.
+  pred_link <- stats::predict(fit, newdata = grid_df, type = "link", se.fit = TRUE)
+  lo_link <- pred_link$fit - 1.96 * pred_link$se.fit
+  hi_link <- pred_link$fit + 1.96 * pred_link$se.fit
   data.frame(
     Predicted = 1 / (1 + exp(-grid_lp)),
-    Observed  = as.numeric(obs)
+    Observed  = stats::plogis(pred_link$fit),
+    Lower     = stats::plogis(lo_link),
+    Upper     = stats::plogis(hi_link)
   )
 }
 
 cal_smooth_list <- list()
-cal_spine_list  <- list()
+cal_event_list  <- list()
 for (nm in cal_models) {
   for (j in seq_along(PRED_TIMES)) {
     tt <- PRED_TIMES[j]
@@ -3138,38 +3162,37 @@ for (nm in cal_models) {
       cur$Model <- nm; cur$Time <- tt
       cal_smooth_list[[length(cal_smooth_list) + 1L]] <- cur
     }
-    hh <- graphics::hist(pvec, breaks = seq(0, 1, length.out = 21), plot = FALSE)
-    cal_spine_list[[length(cal_spine_list) + 1L]] <- data.frame(
-      Model = nm, Time = tt, x = hh$mids, h = hh$counts
+    # Show the predicted risk of each death observed by this horizon.
+    is_case <- test_set[[EVENT_VAR]] == 1L & test_set[[TIME_VAR]] <= tt
+    cal_event_list[[length(cal_event_list) + 1L]] <- data.frame(
+      Model = nm, Time = tt, x = pvec[is_case]
     )
   }
 }
 
 if (length(cal_smooth_list) > 0L) {
   cal_smooth_df <- bind_rows(cal_smooth_list)
-  cal_spine_df  <- bind_rows(cal_spine_list)
+  cal_event_df  <- bind_rows(cal_event_list)
   cal_smooth_df$Time_lab <- factor(paste0(cal_smooth_df$Time, "-day"),
                                    levels = c("28-day", "90-day"))
-  cal_spine_df$Time_lab  <- factor(paste0(cal_spine_df$Time, "-day"),
+  cal_event_df$Time_lab  <- factor(paste0(cal_event_df$Time, "-day"),
                                    levels = c("28-day", "90-day"))
 
   cal_model_labels <- c(Cox = "Cox", ElasticNet_Cox = "ElasticNet",
                         XGBoost = "XGBoost", RSF = "RSF")
   cal_smooth_df$Model_lab <- cal_model_labels[cal_smooth_df$Model]
-  cal_spine_df$Model_lab  <- cal_model_labels[cal_spine_df$Model]
-
-  # Spine: predicted-risk histogram rescaled to the bottom 18% of the panel.
-  cal_spine_df <- cal_spine_df |>
-    group_by(Model_lab, Time_lab) |>
-    mutate(h_scaled = h / max(h) * 0.18) |>
-    ungroup()
+  cal_event_df$Model_lab  <- cal_model_labels[cal_event_df$Model]
 
   p_cal <- ggplot(cal_smooth_df, aes(x = Predicted, y = Observed)) +
     geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey50") +
-    geom_segment(
-      data = cal_spine_df,
-      aes(x = x, xend = x, y = 0, yend = h_scaled),
-      inherit.aes = FALSE, color = "grey75"
+    geom_ribbon(
+      aes(ymin = Lower, ymax = Upper),
+      alpha = 0.15, color = NA
+    ) +
+    geom_rug(
+      data = cal_event_df,
+      aes(x = x), sides = "b",
+      inherit.aes = FALSE, color = "grey30", alpha = 0.45
     ) +
     geom_line(aes(color = Model_lab), linewidth = 0.9) +
     coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
@@ -3775,13 +3798,20 @@ calc_ipcw_case_control_weights <- function(time, event, horizon) {
   list(C = sum(w[case]), K = sum(w[control]), N = length(time))
 }
 
+# DCA is restricted to the four developed survival models.
+# Raw MELD/MELD-Na scores are retained in discrimination comparisons;
+# their exploratory development-mapped Brier outputs are not DCA inputs.
+dca_models <- c("Cox", "ElasticNet_Cox", "XGBoost", "RSF")
+if (!all(dca_models %in% names(test_calibrated_prob))) {
+  stop("DCA requires probabilities from all four developed survival models.")
+}
 dca_thresholds <- seq(0.05, 0.80, by = 0.01)
 
 # ------------------------------------------------------------
 # Development DCA (apparent / in-sample)
 # ------------------------------------------------------------
 dev_dca_prob <- list()
-for (nm in names(test_calibrated_prob)) {
+for (nm in dca_models) {
   if (nm == "RSF") {
     dev_dca_prob[[nm]] <- dev_rsf_mortality
   } else {
@@ -3844,7 +3874,7 @@ write.csv(
 # Test DCA (locked predictions)
 # ------------------------------------------------------------
 dca_results <- list()
-for (nm in names(test_calibrated_prob)) {
+for (nm in dca_models) {
   pmat <- test_calibrated_prob[[nm]]
   for (j in seq_along(PRED_TIMES)) {
     tt <- PRED_TIMES[j]
@@ -3891,8 +3921,8 @@ write.csv(dca_df,
           row.names = FALSE, fileEncoding = "UTF-8")
 
 # ------------------------------------------------------------
-# Combined DCA figure: 2x2 (28d + 90d x Development + Test), shared y-axis,
-# negative values compressed to 1/5 of the total y-axis height.
+# Combined DCA figure: 2x2 (28d + 90d x Development + Test), shared linear y-axis.
+# Display range: -0.05 to 0.30. Clipping does not change raw net-benefit values.
 # ------------------------------------------------------------
 if (nrow(dev_dca_df) > 0) dev_dca_df$Dataset <- "Development (apparent)"
 if (nrow(dca_df) > 0)     dca_df$Dataset     <- "Test"
@@ -3900,13 +3930,6 @@ if (nrow(dca_df) > 0)     dca_df$Dataset     <- "Test"
 dca_plot_df <- bind_rows(dev_dca_df, dca_df)
 
 if (nrow(dca_plot_df) > 0) {
-  nb_finite <- dca_plot_df$Net_Benefit[is.finite(dca_plot_df$Net_Benefit)]
-  max_pos <- ceiling(max(nb_finite[nb_finite >= 0], na.rm = TRUE) / 0.05) * 0.05
-  min_neg <- floor(min(nb_finite[nb_finite < 0], na.rm = TRUE) / 0.5) * 0.5
-  if (!is.finite(min_neg)) min_neg <- -0.5
-  min_neg <- max(min_neg, -5)          # safety clamp: prevent negative-value explosion from aberrant IPCW weights
-  k <- max_pos / (4 * abs(min_neg))    # compress negatives to 1/5 of the total y-axis height
-
   model_labels <- c(Cox = "Cox", ElasticNet_Cox = "ElasticNet", XGBoost = "XGBoost",
                     RSF = "RSF",
                     Treat_All = "Treat All", Treat_None = "Treat None")
@@ -3914,6 +3937,7 @@ if (nrow(dca_plot_df) > 0) {
     model_labels[as.character(dca_plot_df$Model)],
     levels = c("Cox", "ElasticNet", "XGBoost", "RSF", "Treat All", "Treat None")
   )
+  if (anyNA(dca_plot_df$Model)) stop("Unmapped model labels in DCA figure.")
   model_colors <- c(Cox = "#4477AA", ElasticNet = "#EE6677", XGBoost = "#228833",
                     RSF = "#CCBB44",
                     `Treat All` = "grey60", `Treat None` = "black")
@@ -3923,25 +3947,21 @@ if (nrow(dca_plot_df) > 0) {
   dca_plot_df$Time_lab <- factor(paste0(dca_plot_df$Time, "-day"),
                                  levels = c("28-day", "90-day"))
 
-  # Manual broken axis: negatives are scaled by k to 1/5 while the positive half keeps its original scale (ordinary linear axis).
-  dca_plot_df$Net_Benefit_plot <- ifelse(
-    dca_plot_df$Net_Benefit >= 0, dca_plot_df$Net_Benefit, dca_plot_df$Net_Benefit * k
-  )
-  pos_breaks_orig <- seq(0, max_pos, by = 0.05)
-  neg_breaks_orig <- seq(0, min_neg, by = -1)[-1]
-  plot_breaks <- c(neg_breaks_orig * k, pos_breaks_orig)
-  break_labels <- c(as.character(neg_breaks_orig), sprintf("%.2f", pos_breaks_orig))
+  # Plot original net benefit; coord_cartesian clips only the displayed view.
+  plot_breaks <- seq(-0.05, 0.30, by = 0.05)
+  break_labels <- sprintf("%.2f", plot_breaks)
 
   p_dca <- ggplot(
     dca_plot_df,
-    aes(x = Threshold, y = Net_Benefit_plot, color = Model, linetype = Model)
+    aes(x = Threshold, y = Net_Benefit, color = Model, linetype = Model)
   ) +
     geom_hline(yintercept = 0, color = "grey80") +
     geom_line(linewidth = 0.7) +
     facet_grid(Time_lab ~ Dataset, scales = "fixed") +
     scale_x_continuous(breaks = seq(0, 0.8, by = 0.2), limits = c(0, 0.8)) +
     scale_y_continuous(breaks = plot_breaks, labels = break_labels,
-                       limits = c(min_neg * k, max_pos)) +
+                       expand = expansion(mult = 0)) +
+    coord_cartesian(ylim = c(-0.05, 0.30), clip = "on") +
     scale_color_manual(values = model_colors) +
     scale_linetype_manual(values = model_ltypes) +
     theme_classic(base_size = 11) +
@@ -3949,7 +3969,8 @@ if (nrow(dca_plot_df) > 0) {
           legend.key.width = unit(1.2, "cm"),
           strip.text = element_text(face = "bold"),
           panel.spacing = unit(0.8, "lines")) +
-    labs(x = "Threshold probability", y = "Net benefit")
+    labs(x = "Threshold probability", y = "Net benefit",
+         caption = "Net benefit below -0.05 is not displayed.")
 
   ggsave(file.path(OUT_DIR_FIG, "DCA_28_90_combined.png"), p_dca, width = 9, height = 7, dpi = 300)
   ggsave(file.path(OUT_DIR_FIG, "DCA_28_90_combined.pdf"), p_dca, width = 9, height = 7)
@@ -4508,7 +4529,7 @@ message("  09_TEST_locked_risk_groups.csv")
 message("  09_TEST_Kaplan_Meier_risk_groups.pdf")
 message("  10_Development_DCA_28_90_IPCW.csv")
 message("  10_TEST_DCA_28_90_IPCW.csv")
-message("  10_DCA_28day_IPCW.png / 10_DCA_90day_IPCW.png")
+message("  DCA_28_90_combined.png / DCA_28_90_combined.pdf")
 message("  ACLF_Survival_ML_FIX7_FINAL_28_90_results.xlsx")
 message("")
 message("====================================================")
